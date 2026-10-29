@@ -77,6 +77,8 @@ CACHE_FILE = Path("data/historical_load_cache.json")
 PAST_SEASON_REFRESH_DAYS = 60
 # Current season and extra leagues get new rows weekly — refresh every 7 days
 CURRENT_SEASON_REFRESH_DAYS = 7
+# A league with more completed matches than this is considered seeded.
+SEEDED_LEAGUE_MIN_MATCHES = 500
 
 # Mapping CSV column names to (bookmaker, market_type, selection)
 # These columns are available in football-data.co.uk mmz4281 CSVs
@@ -161,7 +163,8 @@ class HistoricalDataLoader(BaseScraper):
         """Load historical data for all configured leagues."""
         await self.load_all_leagues()
 
-    async def load_all_leagues(self, seasons: List[str] = None):
+    async def load_all_leagues(self, seasons: List[str] = None,
+                               leagues: List[str] = None):
         """Load historical results for all mapped leagues.
 
         Uses a file-based cache (data/historical_load_cache.json) to skip
@@ -183,21 +186,30 @@ class HistoricalDataLoader(BaseScraper):
         # loader entirely.  The football-data.org scraper (step 1b) and Flashscore
         # already cover current-season results.  Re-parsing CSVs with per-row DB
         # queries is far too slow over a remote connection (Neon).
-        db = get_db()
-        with db.get_session() as session:
-            match_count = session.query(Match).filter(
-                Match.home_goals.isnot(None)
-            ).count()
-        if match_count > 2000:
-            logger.info(
-                f"Historical loader: {match_count:,} completed matches in DB — "
-                f"skipping (football-data.org handles current season updates)"
-            )
-            return 0
-
         # Only load leagues that are actually configured — each CSV row costs
         # several round-trips to a remote DB, so unused leagues are pure waste.
-        configured = set(self.config.get("scraping.flashscore_leagues", []) or [])
+        configured = set(leagues or self.config.get("scraping.flashscore_leagues", []) or [])
+
+        # Skip leagues that already hold a seeded history. This used to be a
+        # single global "> 2000 matches" check, which stopped any newly added
+        # league from ever being seeded once the first ones were loaded.
+        db = get_db()
+        seeded = set()
+        with db.get_session() as session:
+            for league in configured:
+                n = session.query(Match).filter(
+                    Match.league == league, Match.home_goals.isnot(None)
+                ).count()
+                if n > SEEDED_LEAGUE_MIN_MATCHES:
+                    seeded.add(league)
+        if seeded:
+            logger.info(
+                f"Historical loader: already seeded, skipping {sorted(seeded)} "
+                f"(football-data.org handles current season updates)"
+            )
+        configured -= seeded
+        if not configured:
+            return 0
 
         # Main leagues (mmz4281 per-season format)
         for league, info in LEAGUE_CSV_MAP.items():

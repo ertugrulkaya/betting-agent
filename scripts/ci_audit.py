@@ -119,7 +119,9 @@ WORKFLOWS = ("daily-picks.yml", "closing-lines.yml", "paper-trading-report.yml",
 #: Workflow files deliberately outside the audit, each with its reason. Empty
 #: today: every workflow is audited. An entry here is a decision, not an
 #: oversight, and the guard above is what makes that distinction real.
-UNAUDITED_WORKFLOWS: Dict[str, str] = {}
+UNAUDITED_WORKFLOWS: Dict[str, str] = {
+    "preload-history.yml": "manual one-off seeding of a newly added league; not scheduled, so there is nothing to alarm on",
+}
 
 #: Workflows that are LISTED and LEDGERED but never ALARMED on.
 #:

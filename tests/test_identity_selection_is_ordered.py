@@ -72,7 +72,7 @@ EXISTENCE_PROBES = {
     # this (match, bookmaker, market, selection)" and the caller's only response
     # is `continue`. WHICH row comes back cannot change the outcome, so an
     # ORDER BY would be noise pinned by a test.
-    "src/scrapers/historical_loader.py:475",
+    "src/scrapers/historical_loader.py:495",
 }
 
 #: How many lines above a `.first()` / `.all()` to look for its `.order_by(`.

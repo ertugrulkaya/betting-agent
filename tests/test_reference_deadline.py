@@ -345,7 +345,7 @@ def test_every_run_reports_WHICH_leagues_were_covered_and_which_were_not():
 
     line = sd.format_reference_deadline(c)
     for part in ("serves=2026-10-20", "deadline=09:30", "bound_by=CONSTANT",
-                 "coverage=1 of 2", "present=2", "absent=7", "usable=2",
+                 "coverage=5 of 6", "present=2", "absent=7", "usable=2",
                  "other_day"):
         assert part in line, f"the report line omits {part!r}: {line}"
 

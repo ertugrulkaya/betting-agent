@@ -1,0 +1,63 @@
+name: Preload League History
+
+# Seeds the historical results/odds of newly added leagues, one parallel job
+# per league. The daily run loads leagues one after another, which takes about
+# an hour per league against the remote database.
+on:
+  workflow_dispatch:
+    inputs:
+      leagues:
+        description: 'Comma-separated league keys, e.g. england/premier-league,spain/laliga'
+        required: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      leagues: ${{ steps.split.outputs.leagues }}
+    steps:
+      - id: split
+        env:
+          LEAGUES: ${{ inputs.leagues }}
+        run: |
+          echo "leagues=$(python3 -c 'import json,os; print(json.dumps([l.strip() for l in os.environ["LEAGUES"].split(",") if l.strip()]))')" >> "$GITHUB_OUTPUT"
+
+  preload:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        league: ${{ fromJson(needs.plan.outputs.leagues) }}
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      MODEL_HMAC_KEY: ${{ secrets.MODEL_HMAC_KEY }}
+      TABLES_CREATED: 1
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt -c constraints.txt
+      - run: cp config/config.example.yaml config/config.yaml
+      - name: Load ${{ matrix.league }}
+        env:
+          LEAGUE: ${{ matrix.league }}
+        run: |
+          python - <<'PYEOF'
+          import asyncio, os
+          from src.scrapers.historical_loader import HistoricalDataLoader
+
+          async def main():
+              loader = HistoricalDataLoader()
+              try:
+                  n = await loader.load_all_leagues(leagues=[os.environ["LEAGUE"]])
+                  print(f"{os.environ['LEAGUE']}: {n} matches loaded")
+              finally:
+                  await loader.close()
+
+          asyncio.run(main())
+          PYEOF
