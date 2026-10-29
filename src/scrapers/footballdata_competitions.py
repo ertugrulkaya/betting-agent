@@ -61,4 +61,4 @@ REFERENCE_LEAGUES = frozenset(
 #: where configured is `scraping.flashscore_leagues` in `config/config.yaml`.
 #: Re-derived by `test_the_COVERAGE_FRACTION_is_re_derived_from_the_config`, so
 #: it cannot drift into a stale literal the way the `LIVE` cron label did.
-REFERENCE_COVERAGE_MEASURED = (1, 1)  # Serie A only
+REFERENCE_COVERAGE_MEASURED = (1, 2)  # Serie A covered; Süper Lig not on free tier

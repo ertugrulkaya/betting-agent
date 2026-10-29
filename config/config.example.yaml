@@ -13,8 +13,9 @@ scraping:
   # days. Upgrade to a paid tier (7,500/day) for full coverage.
   # -------------------------------------------------------------------------
   flashscore_leagues:
-    # Serie A only (free-tier API budgets)
+    # Serie A + Süper Lig only (free-tier API budgets)
     - italy/serie-a
+    - turkey/super-lig
 
   off_season_leagues: []
 
