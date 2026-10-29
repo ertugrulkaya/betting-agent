@@ -1,0 +1,385 @@
+# Football Betting Agent Configuration
+# Copy this file to config.yaml and fill in your secrets.
+# In CI environments this file is used directly; secrets are injected via env vars.
+
+scraping:
+  # -------------------------------------------------------------------------
+  # ALL MAPPED LEAGUES ENABLED (2026-08-02). Every club/continental league in
+  # LEAGUE_ID_MAP (apifootball_scraper.py) is scraped. Off-season leagues cost
+  # nothing until they kick off (0 fixtures = 0 odds requests), so pre-enabling
+  # is safe. BUDGET NOTE: on the API-Football FREE tier (100 requests/day, ~1
+  # request per match for odds), busy in-season weekends across all top
+  # divisions exceed 100 — odds (and therefore picks) will be PARTIAL on those
+  # days. Upgrade to a paid tier (7,500/day) for full coverage.
+  # -------------------------------------------------------------------------
+  flashscore_leagues:
+    # Serie A only (free-tier API budgets)
+    - italy/serie-a
+
+  off_season_leagues: []
+
+  # Flashscore's WC pages are Cloudflare-blocked in CI (fixtures AND results
+  # time out ~90s each + alert noise). API-Football provides WC fixtures,
+  # results, and odds, so Flashscore adds nothing for this competition.
+  flashscore_skip_leagues:
+    - world/fifa-world-cup
+
+  flashscore_skip_fixtures_leagues: []
+
+  # UEFA qualifying results pages time out on Flashscore in CI (Cloudflare, same
+  # as the WC) — ~2.5 min wasted per league, 0 results scraped. API-Football
+  # covers their results, so skip the Flashscore results scrape for them.
+  flashscore_skip_results_leagues:
+    - europe/champions-league
+    - europe/europa-league
+    - europe/europa-conference-league
+
+  update_interval_hours: 6
+  headless: true
+  request_delay: 3  # seconds between requests
+
+database:
+  # Set DATABASE_URL env var for PostgreSQL (Neon), or leave unset for local SQLite
+  # url: postgresql://user:pass@host/db?sslmode=require
+  sqlite_path: data/football_betting.db  # fallback when DATABASE_URL is not set
+
+models:
+  ensemble_weights:
+    poisson: 0.25
+    xgboost: 0.35
+    random_forest: 0.20
+    elo: 0.20
+  # Weight for blending bookmaker implied probabilities (over/under, BTTS AND
+  # 1X2) with the model's own predictions. 0.80 = 80% bookmaker, 20% model.
+  #
+  # 0.40 -> 0.60 on 2026-06-15 (755 settled picks showed the model was
+  # overconfident with no edge). 0.60 -> 0.80 on 2026-08-07 by the immutable
+  # baseline (scripts/run_baseline.py, 1,901 out-of-sample matches):
+  #
+  #   market 100%  log-loss 0.9906   <- best
+  #   market  85%           0.9920   not significantly worse
+  #   market  80%           0.9928   not significantly worse
+  #   market  75%           0.9938   SIGNIFICANTLY worse
+  #   market  60%           0.9979   SIGNIFICANTLY worse  (was shipped)
+  #
+  # Decision rule, fixed before the sweep: take the SMALLEST bookmaker weight
+  # whose log-loss is statistically indistinguishable from the pure-market
+  # baseline under a paired bootstrap. That is 0.80. Keeping a 20% model share
+  # (rather than going to 1.0) preserves a measurable model contribution so the
+  # learning loop still produces signal to evaluate.
+  #
+  # Set to 0.0 to disable (pure model); 1.0 makes the system a pure
+  # market-consensus price-shopper.
+  bookmaker_blend_weight: 0.80
+  # Weight for blending the dedicated GoalsMLModel over/under prediction
+  # with Poisson+bookmaker. 0.25 = 25% ML, 75% Poisson+bookmaker.
+  # Set to 0.0 to disable. GoalsMLModel must be trained via --train first.
+  goals_ml_blend_weight: 0.25
+  # Ceiling above which extreme probabilities are dampened back toward the ceiling.
+  # E.g. 0.90 means 98% → 92.4% (excess retained at 30%). Set to 1.0 to disable.
+  extreme_confidence_ceiling: 0.90
+  # Dixon-Coles correction parameter ρ for low-scoring outcomes.
+  # DISABLED (0.0) on 2026-08-07. Walk-forward over 5,771 out-of-sample matches:
+  # on Over/Under 2.5 — the market DC is designed to fix — log-loss was 0.7083 at
+  # ρ=-0.13 and 0.7084 at ρ=0, i.e. no effect. On 1X2 it is actively harmful:
+  # ρ=0 beat every negative ρ at every half-life tested. Restricted grid
+  # (ρ ∈ {-0.10, -0.05, 0, +0.05} × half-life ∈ {180, 365, 540, 730}) put
+  # ρ=0 best or tied at every half-life.
+  dixon_coles_rho: 0.0
+  # Time-decay half-life for Poisson strength calculations (days).
+  # 180 -> 540 on 2026-08-07. Same restricted grid: 180d was the WORST half-life
+  # tested (log-loss 1.0364 at ρ=0 vs 1.0315 at 540d and 1.0314 at 730d — 540
+  # and 730 are tied within noise, and the shorter memory is preferred on a tie).
+  # Combined change (180/-0.13 -> 540/0.0) improves log-loss by +0.0063 nats,
+  # paired bootstrap 95% CI [+0.0028, +0.0098] — significant.
+  # The model was being starved of data, not kept fresh.
+  strength_half_life_days: 540
+  # REMOVED 2026-10-20 — `weather_features_enabled` and the whole weather
+  # producer were deleted. The six `weather_*` keys were computed on every
+  # live fixture and read by nothing: training skipped them, and at predict
+  # time `_align_features` dropped them. The flag is gone rather than left
+  # defaulting, because a config key for a producer that does not exist is
+  # the next reader's wasted afternoon.
+  # International goals dampening: blend Poisson goal probs toward neutral priors
+  # for CL/EL/ECL matches. 0.30 = 30% prior, 70% Poisson. Set to 0.0 to disable.
+  intl_goals_dampen: 0.30
+  # Bayesian shrinkage: teams with < shrinkage_sample_cap total matches have their
+  # Poisson attack/defense strengths regressed toward league average (1.0).
+  shrinkage_sample_cap: 100
+  # Minimum matches per league to estimate a per-league Dixon-Coles rho via MLE.
+  # Leagues with fewer matches use the global dixon_coles_rho instead.
+  dc_rho_min_matches: 50
+  # Per-league rho estimation is OFF: it runs a scipy optimisation over every
+  # league x every match on every fit() (~10 fits a CI day) and buys nothing
+  # measurable — see the dixon_coles_rho note above.
+  dc_rho_per_league: false
+  # Bayesian ensemble weight learning: half-life (days) for temporal decay
+  # of observations. 90 = observations 3 months ago have half the weight.
+  bayesian_weight_half_life_days: 90
+  # Prior strength: effective pseudo-observations from config weights.
+  # Higher = more data needed before per-league weights diverge from global.
+  bayesian_prior_strength: 10
+  # Use xG instead of raw goals for Poisson attack/defense strengths when
+  # xG data is available. Falls back to raw goals for matches without xG.
+  # Isotonic probability calibration (docs/calibration-plan.md). Evaluated
+  # 2026-07-21 and NOT enabled: the acceptance backtest failed — July's
+  # predictions are already well calibrated (raw eval buckets within ±3pp)
+  # after the 0.60 bookmaker blend + market-anchored pipeline, so applying the
+  # June-fitted map over-corrected (+12pp underconfident, Brier worse). The map
+  # is refit after every settle and a 30-day drift check is logged; flip this
+  # to true if the drift check warns that overconfidence has returned.
+  probability_calibration_enabled: false
+  poisson_use_xg: true
+  # Minimum fraction of matches with xG data required before xG-based
+  # strengths are used for a team (0.35 = at least 35% of matches need xG).
+  # Lowered from 0.50 to enable partial xG usage for teams with moderate coverage.
+  poisson_xg_min_coverage: 0.35
+  # ML model auto-retraining: retrain if models are older than N days.
+  # Triggered automatically after settlement via learn_from_settled().
+  ml_retrain_days: 3
+  # Drawdown circuit breaker: reduces stakes during losing streaks.
+  drawdown_lookback_picks: 30       # number of recent settled picks to evaluate
+  drawdown_reduce_threshold: -0.10  # ROI below this starts reducing stakes
+  drawdown_pause_threshold: -0.30   # ROI below this pauses all betting
+  # Targeted backfill: seasons to fetch history for low-coverage teams
+  # API-Football free tier supports 2022-2024 only (2025 returns plan restriction error)
+  backfill_seasons: [2022, 2023, 2024]
+  # Minimum matches a team needs before it's no longer considered low-coverage
+  backfill_min_matches: 10
+  # Max API requests for injury fetching per run (leaves room for backfill)
+  max_injury_budget: 30
+  retrain_interval_days: 7
+  min_training_samples: 1000
+
+betting:
+  # ---------------------------------------------------------------------------
+  # Outcome-derived gates (Stage 3, Phase 4). Every rule below was originally
+  # justified by a settled-pick sample of 30-100 bets, selected by inspecting the
+  # outcomes of those same bets. All were re-tested walk-forward on a holdout
+  # window they were never fitted on (train 2026-02-28..04-26, validate ..06-17,
+  # holdout ..08-05). NONE survived — see src/betting/gate_registry.py for each
+  # one's provenance, holdout verdict and ROI effect.
+  #
+  # They are therefore OFF. Setting one to true re-enables it; record the new
+  # evidence in gate_registry when you do.
+  #
+  # Notable: club_pick_min_ev's excluded cohort returned +4.3% in the holdout and
+  # applying the gate cost 1.95pp of overall holdout ROI.
+  # ---------------------------------------------------------------------------
+  gates:
+    club_btts_yes_ban: false
+    club_pick_min_ev: false
+    club_pick_min_blend: false
+    split_agreement_low_conf: false
+
+  # ---------------------------------------------------------------------------
+  # Prospective measurement (Stage 4, Phases 9 and 12)
+  # ---------------------------------------------------------------------------
+  # Paper trading: still generate, save, settle and measure picks, but flag them
+  # is_paper=True and keep them out of the live ROI record. This is the mode to
+  # run in while the CLV series accumulates — Stage 4's conclusion is that no
+  # production weight change is justified until 200-500 valid closing lines
+  # exist, and until then a live record only adds variance to a question the
+  # data cannot yet answer.
+  # PAPER TRADING — ENABLED 2026-08-10 (Stage 7, section 11).
+  #
+  # Picks are still generated, saved, settled and measured, but are flagged
+  # is_paper=true and held out of everything that either reports live
+  # performance or changes what the frozen model does next (see
+  # betting_agent._live_only). The Telegram message carries an explicit
+  # "DO NOT BET REAL MONEY" banner.
+  #
+  # Enabled only after every section-11 safety check passed:
+  #   migrations 003/004/005 applied .... verified against production
+  #   model_version stamped ............ stage5_baseline_20260807.ac04cc
+  #   live ROI excludes paper .......... 12 isolation tests
+  #   settlement covers paper .......... settle_predictions does not filter it
+  #   CLV fields immutable ............. capture only writes status='pending'
+  #   pre-Claude record protected ...... model_* snapshot never overwritten
+  #   paper cannot look like a real bet  Telegram banner + test
+  #   health checks .................... paper_trading_report --health-only
+  #   rollback ......................... set this back to false
+  #
+  # ACTIVATION: CI copies config.example.yaml -> config.yaml, so THIS file is
+  # what production reads. The change takes effect on the next pipeline run
+  # after it is committed and pushed.
+  # ROLLBACK: set to false. Existing paper rows keep is_paper=true and stay out
+  # of the live record; nothing needs backfilling.
+  paper_trading_mode: true
+
+  # How close to kickoff scripts/capture_closing_lines.py looks for pending
+  # picks. Not hard-coded, because how late a capture can get depends on how
+  # often the odds refresh runs in your deployment. A capture taken earlier than
+  # evaluation/clv.DEFAULT_MAX_CAPTURE_LEAD before kickoff is rejected as "not a
+  # close" rather than silently weakening the CLV series.
+  clv_capture_window_minutes: 90
+
+  # Imminent-odds refresh (Stage 6). A closing line is only a closing line if it
+  # was captured close to kickoff: clv.validate_pair rejects a snapshot taken
+  # more than 180 minutes before it. The daily 09:37 UTC pipeline leaves odds
+  # 8-10 hours stale by an evening kickoff, so scripts/refresh_and_capture.py
+  # refreshes just before capturing.
+  #
+  # window: how far ahead to look for fixtures worth refreshing. 120 leaves 60
+  # minutes of margin against the 180-minute validity limit.
+  # min_interval: a league refreshed inside this many minutes is already fresh
+  # enough; refreshing again buys nothing and costs 2 credits.
+  #
+  # SIMULATED (scripts/simulate_odds_quota.py, pre-2026-08): replaying the
+  # selection rules over production history under a rule fixed in advance —
+  # fewest scheduled runs subject to <=400 credits/month, >=95%% pick coverage,
+  # and window <=150 min — returned 2-hourly runs, 256 credits/month, 96%%
+  # coverage. That is a SIMULATION and was recorded here as though it were a
+  # measurement; it is the third instance of this simulator's output being read
+  # back as fact (see the README's 212 credits/month and its 212-vs-340
+  # comparison). Relabelled rather than replaced, because swapping in a fresher
+  # number would preserve the error.
+  #
+  # MEASURED 2026-08-25 over 2026-08-14 -> 08-25: 63%% of CAPTURABLE picks
+  # captured (61 of 116 in requested markets), ~436 credits/month actual burn.
+  # The 96%% and the 63%% are not the same quantity measured twice — the
+  # simulation counted pick coverage, this counts closing-line capture — and
+  # the fact that they were ever compared is exactly what untagged numbers do.
+  odds_refresh_window_minutes: 120
+  odds_refresh_min_interval_minutes: 180
+
+  min_odds: 1.50            # Skip very short prices — too little margin for model error
+  max_odds: 10.0
+  min_expected_value: 0.05  # 5% minimum edge — filters noise, improves selectivity
+  min_confidence: 0.55      # 55% minimum model probability — model must give >50% clear majority
+  min_ev_confidence_score: 0.038  # Sliding scale: EV × confidence combined threshold
+                                  # Stricter than before; prevents very-low-confidence picks
+  kelly_fraction: 0.25      # Fractional Kelly — 25% of full Kelly (professional standard)
+  max_stake_percentage: 4.0 # Hard cap: maximum 4% of bankroll per bet
+  max_picks_per_league: 5   # Portfolio: cap exposure per league per day
+  max_total_kelly_pct: 0    # Portfolio: 0 = disabled (show all picks)
+  # Stage 13 Part C: at most ONE pick per match, and it is the
+  # highest-ranked one by the system's own ordering
+  # (EV x confidence x agreement x contrarian).
+  max_picks_per_match: 1
+  # WC mode: save a tracked pick for EVERY World Cup match even when no value
+  # edge exists (highest-EV selection, staked at the Kelly minimum). National-team
+  # competitions only — club leagues keep value-only discipline. Set false to
+  # revert to value-bets-only for the WC too.
+  wc_pick_every_match: true
+  # Club fixtures: when NO selection clears the value gates but the model has
+  # decent data on both teams (coverage score >= this), still save one forced
+  # pick (market-blend best selection, Claude-reviewed) so well-known matchups
+  # don't produce empty days. Minnows below the threshold stay no-bet.
+  # 0 disables (value-only clubs). Added 2026-07-08 (7 fixtures, 0 picks day).
+  club_pick_min_coverage: 0.75
+  # Quality floor for club forced picks: the chosen selection's blended win
+  # probability (50% model + 50% market-implied) must reach this or NO pick is
+  # made for the match. Blocks coin-flips neither source believes in (a 46%-conf
+  # forced pick lost 2026-07-14; that profile wins ~37% historically). 0 disables.
+  club_pick_min_blend: 0.55
+  # Model-EV floor for club forced picks: skip the pick when the model's EV for
+  # the selection is worse than this. Settled data (41 club forced picks since
+  # 2026-07-08): EV >= -5% won 61.5% (+8.5% ROI); deeper-negative EV won 53.6%
+  # (~-13% ROI at 1.5-1.6 odds). null disables.
+  club_pick_min_ev: -0.05
+  # WC "very strong favourite" routs: when the favourite's win prob >= and the
+  # underdog's expected goals <=, the forced pick drops BTTS / underdog markets
+  # (the weak side rarely scores) and backs the favourite's Over 1.5 / Over 2.5.
+  # Ordinary 60/40 games are unaffected (BTTS still allowed). Loosen/tighten here.
+  wc_mismatch_fav_prob: 0.65   # favourite win probability to count as a rout
+  wc_mismatch_dog_xg: 1.10     # underdog expected goals must be at/below this
+  # Scale Kelly stake by model agreement level. Reduces exposure when models disagree.
+  # Markets to exclude from picks. Use market_key names from value_calculator.
+  # Available: home_win, draw, away_win, over_1.5, over_2.5, over_3.5,
+  #   under_1.5, under_2.5, under_3.5, btts_yes, btts_no, home_over_1.5, away_over_1.5
+  excluded_markets:
+    - under_1.5
+    - btts_no
+    - over_3.5    # proven loser in settled data: 38% win, -14% ROI over 32 picks
+    # under_2.5 / under_3.5 re-enabled 2026-08-02 (user request). NOTE: settled
+    # history had Under 2.5 at -32% ROI and Under 3.5 at -16% — watch them.
+  kelly_agreement_scale:
+    unanimous: 1.0
+    majority: 0.80
+    split: 0.60
+    unknown: 0.75
+
+# ---------------------------------------------------------------------------
+# The Odds API — free-tier credit budget (Stage 6)
+#
+# The API charges 1 credit x regions x markets. The scraper requests regions=eu
+# (1) and markets=h2h,totals (2), so every league request costs 2 credits.
+# Both markets are required and neither can be dropped: 330 settled picks are on
+# 1X2 (h2h) and 473 on Over/Under lines (totals).
+#
+# The free tier is 500 credits/month. The budget below is deliberately lower so
+# an unusually busy fixture month cannot exhaust it. Measured on production
+# history, the Stage 6 design costs ~256 credits/month with a worst observed day
+# of 46.
+#
+# Enforcement is claim-before-spend in the api_budget table (a month is keyed by
+# its first day), so concurrent workers cannot both spend the last credit and a
+# crash cannot overspend.
+# ---------------------------------------------------------------------------
+odds_api:
+  monthly_credit_budget: 450
+  safety_margin_credits: 50
+
+notifications:
+  telegram_enabled: true
+  telegram_bot_token: "YOUR_BOT_TOKEN"   # Override via TELEGRAM_BOT_TOKEN env var
+  telegram_chat_id: "YOUR_CHAT_ID"       # Override via TELEGRAM_CHAT_ID env var
+  send_daily_picks: true
+  send_live_alerts: false
+  # Send the "Daily Value Picks" Telegram summary. Briefing ARTICLES are no
+  # longer posted (see briefings.send_to_telegram: false) — the picks summary is
+  # the single Telegram output. Claude still reviews every pick before it is
+  # sent; the summary shows the finalized (possibly switched) selection.
+  suppress_picks_summary: false
+
+# AI match briefings (Claude Opus 4.8 + server-side web search).
+# Requires ANTHROPIC_API_KEY env var (GitHub secret). When unset, briefing
+# commands no-op gracefully so the rest of the pipeline is unaffected.
+briefings:
+  enabled: true               # master switch for the Claude pick review
+  # send_to_telegram: post the full briefing ARTICLE to Telegram. false = Claude
+  # still researches each match and finalizes the pick (KEEP/CHANGE), but no
+  # article is posted — only the daily picks summary goes out. This is the
+  # "predictions only" mode: keep Claude's per-match check, drop the briefings.
+  send_to_telegram: false
+  language: Bulgarian         # language the briefing prose is written in (when posted)
+  # backend: which Claude to use for the research + briefing.
+  #   claude_code   — headless Claude Code CLI billed to the Claude Pro
+  #                   subscription (CLAUDE_CODE_OAUTH_TOKEN secret). $0 extra.
+  #                   Runs on Sonnet. Falls back to anthropic_api if the token
+  #                   is missing but ANTHROPIC_API_KEY is set.
+  #   anthropic_api — direct API (ANTHROPIC_API_KEY), Opus 4.8, per-token credits.
+  # 2026-07-22: back to claude_code — subscription FIRST ($0 billing), and when
+  # the shared Pro 5-hour session limit is hit mid-run the `claude` CLI returns
+  # empty, so api_fallback (below) covers that single briefing via the paid API.
+  # Net effect: use the subscription until it's exhausted, then spend credits.
+  # (Was pinned to anthropic_api 2026-07-16 to spare the Pro budget; that hold
+  # is lifted.)
+  backend: claude_code
+  # api_fallback: when the claude_code backend comes back empty (most often the
+  # shared Claude Pro 5-hour session limit), retry that single briefing via the
+  # Anthropic API so the match still gets covered. Requires funded ANTHROPIC_API_KEY
+  # credits; if the balance is empty it simply fails gracefully (no briefing, as
+  # before). Set false to never spend API credits.
+  api_fallback: true
+  # finalize_picks: the briefing LLM makes the FINAL call on each WC bet — it can
+  # KEEP the model's pick or CHANGE to a different selection with real bookmaker
+  # odds (no veto: a bet is always placed; goal = best prediction at odds > 1.50).
+  # The saved pick is updated to the decision and a code-generated footer shows
+  # the final tracked bet, so the message can never contradict the DB.
+  finalize_picks: true
+  # Claude reviews EVERY saved pick before it is sent — WC every-match picks and
+  # club-league value picks alike — as part of the --picks step.
+
+logging:
+  level: INFO
+  log_file: logs/betting_agent.log
+  log_rotation: "1 week"
+
+data_sources:
+  apifootball_key: "YOUR_APIFOOTBALL_KEY"        # Override via API_FOOTBALL_KEY env var
+  # football-data.org free API key (register at https://www.football-data.org/client/register)
+  # Free tier: 9 top leagues, no daily limit, 10 calls/minute.
+  # Used for fixtures + results (supplements Flashscore, frees API-Football quota for odds).
+  footballdataorg_key: "YOUR_FOOTBALLDATAORG_KEY"  # Override via FOOTBALL_DATA_ORG_KEY env var

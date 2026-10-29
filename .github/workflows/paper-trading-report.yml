@@ -1,0 +1,187 @@
+name: Paper Trading Report
+
+# Stage 11 — the experiment's instrument, on a schedule.
+#
+# WHY THIS EXISTS
+#
+# Stages 5-10 built the whole prospective CLV experiment and Stage 10.1 found
+# that nothing ever ran the report. Collected data nobody looks at is not
+# evidence; without this the MODEL/FINAL series, the coverage figures and the
+# 100/200/500 checkpoints would only ever be seen if someone ran the script by
+# hand.
+#
+# WHEN — CORRECTED 2026-10-21. THIS BLOCK WAS WRONG IN TWO WAYS.
+#
+# It said daily-picks fires 09:37 (it has been `0 0` since 2026-10-18) and
+# that closing-lines' first slot is 11:17, so this job at 10:47 ran "before
+# the first capture". But closing-lines ALSO carries `47 10 * * *`, added
+# deliberately at Stage 15 L4 — so the two fired in the SAME MINUTE, every
+# day, and the stated reason for this job's time was describing a schedule
+# that no longer existed.
+#
+# THE ACTUAL SCHEDULE:
+#
+#   00:00 UTC  daily-picks   — settles yesterday, then generates today
+#                              (+ a measured 3h58m–5h04m scheduler lateness)
+#   10:23 UTC  THIS JOB      — after settlement, before the first capture
+#   10:47 UTC  closing-lines — first capture slot
+#   11:17+     closing-lines — every 2h through 23:17 UTC
+#
+# WHY THIS JOB MOVED AND closing-lines DID NOT. closing-lines' 10:47 slot is
+# load-bearing and measurement-justified: picks for early kickoffs are written
+# between 10:07 and 10:32 UTC, and at 10:17 only 8 of 54 existed. Moving it
+# would change what it captures. This job is read-only, spends nothing and
+# only needs to be after settlement and not mid-write, so it is the one that
+# moves. 10:23 keeps the original intent — a settled, quiet state — and ends
+# the collision.
+#
+# COST
+#
+# Zero Odds API credits: this job never touches the provider. It reads the
+# database and prints. It is strictly READ-ONLY — no pick is written, settled or
+# captured here, and no ODDS_API_KEY is provided to it, so it cannot spend even
+# by accident.
+
+on:
+  schedule:
+    # 10:23 UTC (13:23 Sofia). MOVED OFF `47 10` 2026-10-21: that minute is
+    # closing-lines' first capture slot and the two collided every day. See
+    # the WHEN block above for why this job moved rather than that one.
+    - cron: '23 10 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback window in days'
+        default: '120'
+      model_version:
+        description: 'Restrict to one frozen cohort (blank = all, with a breakdown)'
+        default: ''
+
+concurrency:
+  # Never two reports at once. Queue rather than cancel — a report that starts
+  # is cheap and finishing it costs nothing.
+  group: paper-trading-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        # Minimal: this job reads the database and computes statistics. It never
+        # trains, scrapes or calls an API.
+        #
+        # THE BOUND IS REPEATED HERE BECAUSE THIS STEP DOES NOT READ
+        # requirements.txt — see the same comment in closing-lines.yml.
+        # SQLAlchemy 2.1 resolves a bare `postgresql://` URL to psycopg v3,
+        # which is not installed, so every `create_engine` raises.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints.txt "sqlalchemy>=2.0.0,<2.1" psycopg2-binary pyyaml python-dotenv loguru numpy scipy
+
+      - name: Create directories
+        run: mkdir -p data/models logs
+
+      - name: Create config from example
+        # config.example.yaml is the authoritative production configuration
+        # (Stage 10.2). config/config.yaml is gitignored and never deployed.
+        run: cp config/config.example.yaml config/config.yaml
+
+      - name: Report frozen model identity
+        env:
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+        run: |
+          python - <<'EOF'
+          from src.utils.config import Config
+          from src.models.model_version import model_version, CODE_REVISION
+          cfg = Config("config/config.example.yaml")
+          print(f"CODE_REVISION = {CODE_REVISION}")
+          print(f"model_version = {model_version(cfg)}")
+          EOF
+
+      - name: Paper trading report
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+          # DELIVERY ON SUCCESS, 2026-10-21. Until today the only Telegram
+          # message this job could send was its FAILURE alert, so a working
+          # report and no report at all looked identical from the outside: the
+          # content went to an artifact nobody is told about. These two secrets
+          # are what `--telegram` needs; the report still succeeds if the send
+          # fails, and says so rather than swallowing it.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          DAYS="${{ inputs.days }}"
+          MV="${{ inputs.model_version }}"
+          # `--include-live` IS DELIBERATE, and it no longer pools anything.
+          # It loads the pre-versioning era so the EXPERIMENT SUMMARY can
+          # exclude it WITH A COUNT ("288 pre-experiment picks excluded")
+          # instead of never loading it and printing 0. The gated figures are
+          # invariant to the flag -- verified 2026-10-21, 1250 picks and
+          # -5.52% either way -- and the ungated block above them now names
+          # its own population.
+          ARGS="--days ${DAYS:-120} --include-live --telegram"
+          if [ -n "$MV" ]; then ARGS="$ARGS --model-version $MV"; fi
+
+          # `pipefail` ADDED 2026-10-21, AND IT IS THE WHOLE POINT OF THIS
+          # BLOCK. GitHub runs `run:` under `bash -e` WITHOUT `-o pipefail`, so
+          # a pipeline returns `tee`'s status and the report's exit code was
+          # discarded. Verified: `python -c 'raise SystemExit(1)' | tee
+          # /dev/null` exits 0 bare and 1 under pipefail. The 80% closing-
+          # coverage threshold therefore had NEVER been able to fail this job
+          # — the inventory's "31 runs / 31 ok / 0 fail" was the swallowing,
+          # not health, while coverage sat at 12.5%.
+          set -o pipefail
+          rc=0
+          python -m scripts.paper_trading_report $ARGS \
+            | tee logs/paper-trading-report.txt || rc=$?
+
+          # TWO OUTCOMES, KEPT APART. 2 means the report RAN and a health check
+          # alarmed: the alert is already in the delivered summary and in a
+          # ::warning:: annotation, so the job stays green and the "instrument
+          # is blind today" alert — which would be false — does not fire.
+          # Anything else non-zero means the report could not run, which is a
+          # real failure and the one that alert correctly describes.
+          if [ "$rc" = "2" ]; then
+            echo "Report ran; health alert(s) present and delivered. Not a failure."
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-trading-report-${{ github.run_number }}
+          path: logs/paper-trading-report.txt
+          retention-days: 30
+
+      # ── THE TELEGRAM FAILURE ALERT WAS REMOVED HERE. 2026-10-22. ──────────
+      #
+      # It said "Paper trading report failed … its instrument is blind today."
+      # That is the run's conclusion, and the reader's action was to wait for
+      # tomorrow's run -- which is what would have happened anyway.
+      #
+      # WHAT CARRIES IT NOW: GitHub's own notification on the red run. And the
+      # report this workflow sends is itself the carrier that matters: it
+      # arrives daily with `--telegram`, so a day with no report IS the
+      # signal, and one that a reader notices by absence rather than by being
+      # told.
+      #
+      # MEASURED over 2026-09-22..10-22: 30 runs, 0 failures. This sender had
+      # never fired either. Note that `rc == 2` (a HEALTH ALERT) is
+      # deliberately mapped to `exit 0` above, so a health alert was never
+      # routed through here in the first place.

@@ -1,0 +1,905 @@
+"""Telegram notification bot for betting picks."""
+
+import asyncio
+from dataclasses import dataclass
+from datetime import date, timezone, timedelta
+from html import escape as html_escape
+from pathlib import Path
+from typing import List, Dict
+from itertools import groupby
+
+from src.betting.value_calculator import BetRecommendation
+from src.utils.config import get_config
+from src.utils.logger import get_logger
+
+logger = get_logger()
+
+@dataclass
+class ChunkOutcome:
+    """What happened to ONE part of a report. DEL-3.
+
+    `ok` and `attempted` are separate fields on purpose. A part that was never
+    attempted (Telegram not configured) and a part that was attempted three
+    times and failed are both "not delivered" and are NOT the same fact: the
+    first is a disabled integration, the second is a hole in a report someone
+    is reading. Collapsing them is the defect this project has now closed in
+    four places.
+    """
+
+    ok: bool
+    attempted: bool
+    message: object = None
+    attempts: int = 0
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+# State file tracking whether picks were already sent today (Story 8.2)
+_PICKS_SENT_STATE = Path("data/models/picks_sent_date.txt")
+
+
+def _picks_sent_today() -> bool:
+    """Return True if picks were already sent to Telegram today."""
+    if _PICKS_SENT_STATE.exists():
+        return _PICKS_SENT_STATE.read_text().strip() == date.today().isoformat()
+    return False
+
+
+def _mark_picks_sent_today() -> None:
+    """Write today's date to the state file after a successful Telegram send."""
+    _PICKS_SENT_STATE.parent.mkdir(parents=True, exist_ok=True)
+    _PICKS_SENT_STATE.write_text(date.today().isoformat())
+
+
+_COLD_STREAK_STATE = Path("data/models/cold_streak_alerted_date.txt")
+
+
+def _cold_streak_alerted_today() -> bool:
+    """Return True if a cold-streak Telegram alert was already sent today."""
+    if _COLD_STREAK_STATE.exists():
+        return _COLD_STREAK_STATE.read_text().strip() == date.today().isoformat()
+    return False
+
+
+def _mark_cold_streak_alerted() -> None:
+    """Record that today's cold-streak alert was sent so we don't duplicate it."""
+    _COLD_STREAK_STATE.parent.mkdir(parents=True, exist_ok=True)
+    _COLD_STREAK_STATE.write_text(date.today().isoformat())
+
+
+# League display names for clean formatting
+LEAGUE_DISPLAY = {
+    "england/premier-league": "🏴 Premier League",
+    "england/championship": "🏴 Championship",
+    "spain/laliga": "🇪🇸 La Liga",
+    "spain/laliga2": "🇪🇸 La Liga 2",
+    "germany/bundesliga": "🇩🇪 Bundesliga",
+    "germany/2-bundesliga": "🇩🇪 2. Bundesliga",
+    "italy/serie-a": "🇮🇹 Serie A",
+    "italy/serie-b": "🇮🇹 Serie B",
+    "france/ligue-1": "🇫🇷 Ligue 1",
+    "france/ligue-2": "🇫🇷 Ligue 2",
+    "netherlands/eredivisie": "🇳🇱 Eredivisie",
+    "netherlands/eerste-divisie": "🇳🇱 Eerste Divisie",
+    "portugal/primeira-liga": "🇵🇹 Primeira Liga",
+    "belgium/jupiler-pro-league": "🇧🇪 Jupiler Pro",
+    "turkey/super-lig": "🇹🇷 Super Lig",
+    "scotland/premiership": "🏴 Scottish Prem",
+    "austria/bundesliga": "🇦🇹 Bundesliga",
+    "switzerland/super-league": "🇨🇭 Super League",
+    "greece/super-league": "🇬🇷 Super League",
+    "denmark/superliga": "🇩🇰 Superliga",
+    "norway/eliteserien": "🇳🇴 Eliteserien",
+    "sweden/allsvenskan": "🇸🇪 Allsvenskan",
+    "finland/veikkausliiga": "🇫🇮 Veikkausliiga",
+    "poland/ekstraklasa": "🇵🇱 Ekstraklasa",
+    "romania/liga-1": "🇷🇴 Liga I",
+    "bulgaria/efbet-league": "🇧🇬 efbet Liga",
+    "europe/champions-league": "🏆 Champions League",
+    "europe/europa-league": "🏆 Europa League",
+    "europe/europa-conference-league": "🏆 Conference League",
+}
+
+def _result_icon(result: str | None) -> str:
+    """Return a simple emoji for a pick result."""
+    if result == "win":
+        return "✅"
+    elif result == "loss":
+        return "❌"
+    elif result == "void":
+        return "➖"
+    else:
+        return "⏳"
+
+class TelegramNotifier:
+    """Sends betting picks and alerts via Telegram."""
+
+    def __init__(self, config=None):
+        self.config = config or get_config()
+        notifications = self.config.notifications
+        self.enabled = notifications.get("telegram_enabled", False)
+        self.bot_token = notifications.get("telegram_bot_token", "")
+        self.chat_id = notifications.get("telegram_chat_id", "")
+        self._bot = None
+        #: Why the last `_send_message` returned None. Read by `_send_one` to
+        #: tell "not attempted" from "attempted and failed" — see ChunkOutcome.
+        self._last_send_error = ""
+
+    def _get_bot(self):
+        """Lazy-load the Telegram bot."""
+        if self._bot is None and self.enabled and self.bot_token:
+            try:
+                from telegram import Bot
+                self._bot = Bot(token=self.bot_token)
+                logger.info("Telegram bot initialized")
+            except ImportError:
+                logger.warning("python-telegram-bot not installed, run: pip install python-telegram-bot")
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram bot: {e}")
+        return self._bot
+
+    async def send_daily_picks(self, picks: List[BetRecommendation], stats: dict = None, dropped_picks: list = None, no_injury_data: bool = False, injury_data_stale: bool = False, injury_budget_exhausted: bool = False, force: bool = False, paper_mode: bool = False, experiment=None):
+        """Send daily picks summary via Telegram with rich formatting.
+
+        ``paper_mode`` prefixes an unmistakable banner. This message IS this
+        system's betting action — the reader places bets from it by hand — so a
+        measurement-only pick that looks identical to a live recommendation is a
+        money-safety problem, not a cosmetic one.
+        """
+        if not self.enabled:
+            return
+
+        bot = self._get_bot()
+        if not bot:
+            return
+
+        if not picks:
+            await self._send_message("No value picks found for today.")
+            return
+
+        # Supplement header when picks were already sent earlier today (AC1/AC2 — Story 8.2).
+        # Skipped when force=True (--picks --force always uses the normal header).
+        try:
+            is_supplement = (not force) and _picks_sent_today()
+        except Exception as _e:
+            logger.warning(f"Could not check prior pick sends: {_e}")
+            is_supplement = False
+
+        if is_supplement:
+            header = (
+                f"<b>📋 Supplement to today's picks ({len(picks)} additional):</b>\n"
+                f"<i>{date.today().strftime('%d %b %Y')}</i>\n"
+            )
+        else:
+            header = f"<b>Daily Value Picks - {date.today().strftime('%d %b %Y')}</b>\n"
+            header += f"<i>{len(picks)} picks found</i>\n"
+
+        if paper_mode:
+            header = (
+                "<b>🧪 PAPER TRADING — DO NOT BET REAL MONEY</b>\n"
+                "<i>Recorded for measurement only. These picks are excluded from "
+                "the live record and exist to collect closing-line data.</i>\n\n"
+            ) + header
+
+        # THE FROZEN LIVE ALL-TIME IS GONE FROM THIS HEADER TOO.
+        #
+        # This message carried the same 1,074-pick figure as the settlement and
+        # performance reports. Removing it from two of three would have left the
+        # number in daily circulation from the third — so all three changed.
+        #
+        # The picks message gets the experiment's HEADLINE only: n, cohort count
+        # and the current cohort's n. The full CLV block belongs in the reports,
+        # not on a message about today's selections.
+        if experiment is not None:
+            _wr = experiment.win_rate
+            if _wr is not None:
+                header += (
+                    f"\n📊 <i>Experiment: {experiment.wins}W-{experiment.losses}L "
+                    f"({_wr:.1%}) over n={experiment.settled} in "
+                    f"{experiment.cohorts} cohorts | current cohort n="
+                    f"{experiment.current_n}</i>\n")
+
+        # Group picks by league, then by match
+        picks_by_league: Dict[str, List[BetRecommendation]] = {}
+        for pick in picks:
+            league = pick.league or "Other"
+            picks_by_league.setdefault(league, []).append(pick)
+
+        lines = [header]
+        pick_num = 0
+
+        for league_key in sorted(picks_by_league.keys()):
+            league_picks = picks_by_league[league_key]
+            league_name = html_escape(LEAGUE_DISPLAY.get(league_key, league_key))
+            lines.append(f"\n<b>{league_name}</b>")
+
+            # Group by match within league
+            picks_by_match: Dict[str, List[BetRecommendation]] = {}
+            for pick in league_picks:
+                picks_by_match.setdefault(pick.match, []).append(pick)
+
+            for match_name, match_picks in picks_by_match.items():
+                safe_match = html_escape(match_name)
+                for pick in match_picks:
+                    pick_num += 1
+                    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(pick.risk_level, "⚪")
+                    agreement_icon = _agreement_icon(pick.model_agreement)
+
+                    # ── THE OFFSET IS DERIVED AND THE CLOCK IS NAMED. ──────
+                    #
+                    # This fell back to `timezone(timedelta(hours=2))` — a
+                    # literal that is correct in winter and an hour wrong all
+                    # summer. `match_briefing.py` had the SAME shape with the
+                    # OPPOSITE literal (+3), so the two fallbacks disagreed by
+                    # an hour and each was right for half the year.
+                    # **Europe/Kyiv goes UTC+3 -> UTC+2 on 2026-10-25.**
+                    #
+                    # The card now carries the abbreviation `%Z` resolves to
+                    # (EEST, then EET), because a bare `⏰ 12:30` on a card
+                    # read in two countries is the "establish the clock"
+                    # defect in its original form.
+                    #
+                    # `Europe/Kiev` is the deprecated alias; `Europe/Kyiv` is
+                    # the current name and both resolve. Spelled correctly
+                    # here, with the alias kept as the fallback so an old
+                    # tzdata still answers.
+                    kickoff_str = ""
+                    if pick.match_date:
+                        local_dt = None
+                        try:
+                            from zoneinfo import ZoneInfo
+                            try:
+                                _tz = ZoneInfo("Europe/Kyiv")
+                            except Exception:
+                                _tz = ZoneInfo("Europe/Kiev")
+                            local_dt = pick.match_date.replace(
+                                tzinfo=timezone.utc).astimezone(_tz)
+                        except Exception:
+                            local_dt = None
+                        if local_dt is not None:
+                            kickoff_str = f" ⏰ {local_dt.strftime('%H:%M %Z')}"
+                        else:
+                            # NEVER A GUESSED OFFSET. UTC, said out loud.
+                            kickoff_str = (
+                                " ⏰ "
+                                + pick.match_date.strftime('%H:%M')
+                                + " UTC")
+
+                    # Pick header: number + match name + kickoff
+                    line = f"\n  {risk_emoji} <b>Pick #{pick_num}: {safe_match}</b>{kickoff_str}"
+
+                    # xG
+                    if pick.predicted_xg:
+                        line += f"\n      xG: {pick.predicted_xg}"
+
+                    # Bet + optional line movement
+                    safe_sel = html_escape(pick.selection)
+                    line += f"\n      Bet: <b>{safe_sel}</b> @ {pick.odds:.2f}"
+                    op = getattr(pick, "opening_odds", 0) or 0
+                    if op > 1.0 and abs(pick.odds - op) / op >= 0.03:
+                        direction = "↑" if pick.odds > op else "↓"
+                        pct = (pick.odds - op) / op * 100
+                        line += f" <i>(opened {op:.2f} {direction}{abs(pct):.1f}%)</i>"
+
+                    # EV / Conf / Risk / Stake
+                    line += (
+                        f"\n      EV: {pick.expected_value:.1%} | "
+                        f"Conf: {pick.confidence:.0%} | "
+                        f"Risk: {pick.risk_level}"
+                        f"\n      Stake: {pick.kelly_stake_percentage:.1f}% of bankroll"
+                    )
+
+                    # Model agreement
+                    if pick.model_agreement:
+                        agr_label = pick.model_agreement.upper()
+                        line += f"\n      {agreement_icon} Models: {pick.model_agreement} [{agr_label}]"
+                        if pick.models_for:
+                            line += f" - {pick.models_for} agree"
+
+                    # Contrarian signal
+                    cv = getattr(pick, "contrarian_value", 0) or 0
+                    if cv >= 1.3:
+                        line += f"\n      🎯 Contrarian ({cv:.1f}x vs market)"
+
+                    # xG edge
+                    if pick.xg_edge:
+                        line += f"\n      📈 {pick.xg_edge}"
+
+                    # Fallback odds warning
+                    if pick.used_fallback_odds:
+                        line += "\n      ⚠️ Estimated odds (no bookmaker data)"
+
+                    lines.append(line)
+
+        # Skipped-by-cap section (AC2 — Story 8.1)
+        if dropped_picks:
+            lines.append("\n🚫 <b>Skipped (cap):</b>")
+            for dp in dropped_picks:
+                safe_match = html_escape(dp.match)
+                lines.append(f"  • {safe_match} — {html_escape(dp.market)}")
+
+        if no_injury_data and picks:
+            if injury_budget_exhausted:
+                lines.append("\n⚠️ <i>Injury data unavailable (API budget exhausted, no cached data).</i>")
+            else:
+                lines.append("\n⚠️ <i>Injury data unavailable for some matches (limited API coverage for these leagues).</i>")
+        elif injury_data_stale and picks:
+            lines.append("\n⚠️ <i>Using yesterday's injury data (today's API budget exhausted).</i>")
+
+        # Send (split if needed)
+        message = "\n".join(lines)
+        await self._send_chunked(message, header, report="daily picks")
+        try:
+            _mark_picks_sent_today()
+        except Exception as _mse:
+            logger.warning(f"Could not write picks-sent state file: {_mse}")
+
+    async def send_settlement_report(
+        self,
+        settled_picks: list,
+        stats: dict = None,
+        pending_picks: list = None,
+        experiment=None,
+    ):
+        """Send settlement results for yesterday's picks via Telegram.
+
+        Args:
+            settled_picks: Picks that were settled in this run (from settle_predictions()).
+            stats: All-time stats dict from get_stats().
+            pending_picks: Picks from yesterday that are still unresolved after this
+                run (result=None). Shown with ⏳ so operators know which picks need
+                manual follow-up. Triggers the message even when settled_picks is empty.
+        """
+        pending_picks = pending_picks or []
+        if not self.enabled or (not settled_picks and not pending_picks):
+            return
+
+        from datetime import date, timedelta
+        yesterday = date.today() - timedelta(days=1)
+
+        # Filter settled to yesterday's picks (or show all if dates vary)
+        yesterday_picks = [p for p in settled_picks if p.get("pick_date") == yesterday]
+        picks_to_show = yesterday_picks if yesterday_picks else settled_picks
+
+        wins = sum(1 for p in picks_to_show if p["result"] == "win")
+        losses = sum(1 for p in picks_to_show if p["result"] == "loss")
+        total = wins + losses
+        win_rate = wins / total if total > 0 else 0
+
+        # Calculate profit/loss for the settled batch
+        profit = sum(
+            p["stake"] * (p["odds"] - 1) if p["result"] == "win" else -p["stake"]
+            for p in picks_to_show
+        )
+
+        label = yesterday.strftime('%d %b %Y') if yesterday_picks else "Recent"
+        if picks_to_show:
+            header = f"<b>📊 Settlement Report - {label}</b>\n"
+            profit_emoji = "📈" if profit >= 0 else "📉"
+            header += f"Batch: {wins}W-{losses}L ({win_rate:.0%}) {profit_emoji} {profit:+.1f}%\n"
+        else:
+            # Only pending picks to report — no settled batch header
+            header = f"<b>📊 Settlement Report - {label}</b>\n"
+        # THE FROZEN LIVE ALL-TIME IS GONE FROM THIS MESSAGE.
+        #
+        # `stats["all_time"]` reads `live_only()`, which is the PRE-PAPER-TRADING
+        # live record: 1,074 settled picks at 51.676%, last pick 2026-08-10. It
+        # stopped moving when paper trading began and was reported daily as
+        # though it were current. It now lives in the README with its
+        # measurement date; this message counts from the experiment instead.
+        lines = [header]
+        from src.reporting.experiment_record import format_block
+        lines.extend(format_block(experiment))
+
+        # Group settled picks by league
+        by_league: Dict[str, list] = {}
+        for pick in picks_to_show:
+            lg = pick.get("league", "Other") or "Other"
+            by_league.setdefault(lg, []).append(pick)
+
+        for league_key in sorted(by_league.keys()):
+            league_name = html_escape(LEAGUE_DISPLAY.get(league_key, league_key))
+            league_picks = by_league[league_key]
+            lg_wins = sum(1 for p in league_picks if p["result"] == "win")
+            lg_total = len(league_picks)
+            lines.append(f"\n<b>{league_name}</b> ({lg_wins}/{lg_total})")
+
+            for pick in league_picks:
+                result_emoji = _result_icon(pick.get("result"))
+                score = html_escape(str(pick.get("score", "?-?")))
+                xg_str = ""
+                if pick.get("home_xg") is not None and pick.get("away_xg") is not None:
+                    xg_str = f" | xG: {pick['home_xg']:.1f}-{pick['away_xg']:.1f}"
+
+                safe_match = html_escape(pick['match_name'])
+                safe_sel = html_escape(pick['selection'])
+                lines.append(
+                    f"  {result_emoji} <b>{safe_match}</b> ({score}){xg_str}\n"
+                    f"      {safe_sel} @ {pick['odds']:.2f} | Stake: {pick['stake']:.1f}%"
+                )
+
+        # Period breakdown — the CLOSED live series, labelled as such.
+        #
+        # These windows read `live_only()`, the same frozen pre-paper-trading
+        # record the header used to headline. They are kept because a shrinking
+        # window over a closed series is still a true statement about it, but
+        # they are named so nobody reads them as current.
+        #
+        # The old `s_total < at_total` suppression is gone with the all-time
+        # figure it compared against: it existed to avoid printing the same
+        # number twice, and there is no longer a first copy.
+        if stats:
+            period_lines = []
+            for period, slabel in [("last_30_days", "Last 30 days"), ("last_7_days", "Last 7 days")]:
+                s = stats.get(period, {})
+                s_total = s.get("total", 0)
+                if s_total > 0:
+                    roi_emoji = "📈" if s.get("roi", 0) >= 0 else "📉"
+                    period_lines.append(
+                        f"{slabel}: {s['wins']}W-{s['losses']}L ({s['win_rate']:.0%}) "
+                        f"{roi_emoji} ROI: {s['roi']:.1%}"
+                    )
+            if period_lines:
+                lines.append("\n<b>─── Closed live series (pre-paper-trading) ───</b>")
+                lines.extend(period_lines)
+
+            # Odds source breakdown
+            odds_src = stats.get("odds_source", {})
+            real = odds_src.get("real_odds", {})
+            fb = odds_src.get("fallback_odds", {})
+            if real.get("total", 0) and fb.get("total", 0):
+                lines.append(
+                    f"\n<i>Real odds: {real['win_rate']:.0%} win rate | "
+                    f"Fallback: {fb['win_rate']:.0%} win rate</i>"
+                )
+
+        # Show pending picks from yesterday by name so operators know what to follow up on.
+        # These are picks that had no result in DB after all settlement attempts today.
+        if pending_picks:
+            n = len(pending_picks)
+            lines.append(
+                f"\n<b>⏳ {n} pick{'s' if n != 1 else ''} still pending from {label} — result unavailable</b>"
+            )
+            by_pending_league: Dict[str, list] = {}
+            for p in pending_picks:
+                lg = p.get("league", "Other") or "Other"
+                by_pending_league.setdefault(lg, []).append(p)
+            for lg_key in sorted(by_pending_league.keys()):
+                lg_name = html_escape(LEAGUE_DISPLAY.get(lg_key, lg_key))
+                lines.append(f"\n  <i>{lg_name}</i>")
+                for pick in by_pending_league[lg_key]:
+                    safe_match = html_escape(pick["match_name"])
+                    safe_sel = html_escape(pick["selection"])
+                    lines.append(
+                        f"    ⏳ <b>{safe_match}</b>\n"
+                        f"        {safe_sel} @ {pick['odds']:.2f} | Stake: {pick['stake']:.1f}%"
+                    )
+        elif stats:
+            # No named pending — just show aggregate count if > 0
+            leftover = stats.get("pending", 0)
+            if leftover > 0:
+                lines.append(f"\n⏳ {leftover} other picks still pending")
+
+        message = "\n".join(lines)
+        await self._send_chunked(message, report="settlement report")
+
+    async def send_performance_report(self, stats: dict, experiment=None):
+        """Send a comprehensive performance report via Telegram.
+
+        Includes all-time + recent records, ROI, per-market and per-league
+        breakdowns, Brier score calibration, and — once closing prices exist —
+        genuine CLV. Until then the message reports model-vs-market divergence
+        under its own name; it was previously sent as "Avg CLV" and read +6.3%
+        while realised ROI was -3.6%.
+        """
+        if not self.enabled:
+            return
+
+        from datetime import date
+        header = f"<b>📊 Performance Report — {date.today().strftime('%d %b %Y')}</b>\n"
+
+        lines = [header]
+
+        # THE EXPERIMENT LEADS, AND CLV LEADS THE EXPERIMENT.
+        #
+        # Stage 16 established that win-rate and ROI segments are all p > 0.15
+        # and that CLV is the instrument this experiment turns on. A message
+        # headlining win rate invites exactly the reasoning four audits have
+        # corrected, so the settled record sits BELOW the CLV series as context.
+        from src.reporting.experiment_record import format_block
+        lines.extend(format_block(experiment))
+
+        # ── The CLOSED live series ───────────────────────────────────────────
+        # `all_time` is deliberately absent: it is the frozen 1,074-pick
+        # pre-paper-trading record and belongs in the README, not in a daily
+        # operational message. The shorter windows read the SAME closed series
+        # and are labelled so, or they would be misread as current too.
+        if any(stats.get(p, {}).get("total", 0) > 0
+               for p in ("last_30_days", "last_7_days", "yesterday")):
+            lines.append("\n<b>─── Closed live series (pre-paper-trading) ───</b>")
+        for period, label in [
+            ("last_30_days", "Last 30 Days"),
+            ("last_7_days", "Last 7 Days"),
+            ("yesterday", "Yesterday"),
+        ]:
+            s = stats.get(period, {})
+            if s.get("total", 0) > 0:
+                roi_emoji = "📈" if s.get("roi", 0) >= 0 else "📉"
+                lines.append(
+                    f"\n<b>{label}</b>: {s['wins']}W-{s['losses']}L "
+                    f"({s['win_rate']:.0%}) {roi_emoji} ROI: {s['roi']:.1%}"
+                )
+
+        # ── Calibration & quality metrics ────────────────────────────────────
+        brier = stats.get("brier_score")
+        avg_clv = stats.get("avg_clv")
+        divergence = stats.get("avg_model_market_divergence")
+        if brier is not None or avg_clv is not None or divergence is not None:
+            lines.append("\n<b>─── Model Quality ───</b>")
+            if brier is not None:
+                cal_label = "good" if brier < 0.20 else ("fair" if brier < 0.25 else "poor")
+                lines.append(f"Brier Score: {brier:.4f} ({cal_label})")
+            if avg_clv is not None:
+                # Genuine CLV: the price taken vs the closing price.
+                clv_emoji = "✅" if avg_clv > 0 else "⚠️"
+                lines.append(
+                    f"Avg CLV: {avg_clv:+.3f} {clv_emoji} "
+                    f"(n={stats.get('clv_sample', 0)})")
+            elif divergence is not None:
+                # This number used to be sent as "Avg CLV". It is not: it is the
+                # model's own claimed edge over the price it took, so it reads
+                # healthy even when the model is losing — it showed +6.3% against
+                # a realised -3.6% ROI. Labelled honestly until a closing line
+                # exists to compute real CLV from.
+                lines.append(
+                    f"Model-vs-market divergence: {divergence:+.3f} "
+                    f"(not CLV — no closing line stored yet)")
+
+        # ── Per-market ────────────────────────────────────────────────────────
+        by_market = stats.get("by_market", {})
+        if by_market:
+            lines.append("\n<b>─── By Market ───</b>")
+            for market, ms in sorted(by_market.items(), key=lambda x: x[1].get("total", 0), reverse=True):
+                if ms.get("total", 0) >= 5:
+                    roi_emoji = "📈" if ms.get("roi", 0) >= 0 else "📉"
+                    lines.append(
+                        f"  {html_escape(market)}: {ms['wins']}W-{ms['losses']}L "
+                        f"({ms['win_rate']:.0%}) {roi_emoji} ROI: {ms['roi']:.1%}"
+                    )
+
+        # ── Per-league (top 8 by volume) ──────────────────────────────────────
+        by_league = stats.get("by_league", {})
+        if by_league:
+            lines.append("\n<b>─── By League (top 8) ───</b>")
+            top = sorted(by_league.items(), key=lambda x: x[1].get("total", 0), reverse=True)[:8]
+            for lg_key, ls in top:
+                if ls.get("total", 0) >= 3:
+                    lg_name = html_escape(LEAGUE_DISPLAY.get(lg_key, lg_key))
+                    roi_emoji = "📈" if ls.get("roi", 0) >= 0 else "📉"
+                    lines.append(
+                        f"  {lg_name}: {ls['wins']}W-{ls['losses']}L "
+                        f"({ls['win_rate']:.0%}) {roi_emoji} ROI: {ls['roi']:.1%}"
+                    )
+
+        # ── Calibration buckets ───────────────────────────────────────────────
+        cal = stats.get("calibration", {})
+        if cal:
+            lines.append("\n<b>─── Calibration ───</b>")
+            for bucket, data in sorted(cal.items()):
+                pred = data["predicted_avg"]
+                actual = data["actual_win_rate"]
+                n = data["count"]
+                gap = actual - pred
+                indicator = "✅" if abs(gap) < 0.10 else ("🔼" if gap > 0 else "🔽")
+                lines.append(
+                    f"  {bucket}: pred {pred:.0%} / actual {actual:.0%} (n={n}) {indicator}"
+                )
+
+        # ── Model coverage ────────────────────────────────────────────────────
+        cov = stats.get("model_coverage", {})
+        if cov:
+            ml_status = "✅ Fitted" if cov.get("ml_fitted") else "❌ Not fitted"
+            lines.append(
+                f"\n<i>Coverage: Poisson {cov.get('poisson_teams', 0)} teams | "
+                f"Elo {cov.get('elo_teams', 0)} teams | ML {ml_status}</i>"
+            )
+
+        pending = stats.get("pending", 0)
+        if pending > 0:
+            lines.append(f"\n⏳ {pending} picks still pending")
+
+        message = "\n".join(lines)
+        sent = await self._send_chunked(message, header,
+                                       report="performance report")
+
+        # Pin the report so it stays visible at the top of the group
+        bot = self._get_bot()
+        if bot and self.chat_id and sent:
+            try:
+                await bot.pin_chat_message(
+                    chat_id=self.chat_id,
+                    message_id=sent.message_id,
+                    disable_notification=True,
+                )
+                logger.info("Performance report pinned in Telegram group")
+            except Exception as e:
+                logger.debug(f"Could not pin performance report: {e}")
+
+    async def send_welcome_message(self):
+        """Send a welcome/info message describing the group and the betting agent."""
+        if not self.enabled:
+            return
+
+        msg = (
+            "👋 <b>Welcome to the Football Betting Picks Group!</b>\n\n"
+            "This group is powered by an <b>AI-driven football betting agent</b> that "
+            "analyses matches daily and posts value bets with positive expected value (+EV).\n\n"
+            "<b>🤖 How it works</b>\n"
+            "The agent uses an ensemble of statistical models:\n"
+            "• <b>Poisson model</b> — Dixon-Coles corrected goal prediction with time decay\n"
+            "• <b>Elo ratings</b> — team strength based on historical results\n"
+            "• <b>ML models</b> — XGBoost + Random Forest trained on 30 000+ matches\n"
+            "• <b>Bookmaker blend</b> — implied market probabilities as a calibration anchor\n"
+            "• <b>Bayesian weights</b> — per-league adaptive weighting based on past accuracy\n\n"
+            "<b>📋 What gets posted each day</b>\n"
+            "• ✅ <b>Daily picks</b> — posted every morning with match, bet type, odds, EV%, stake size\n"
+            "• 📊 <b>Settlement report</b> — results of the previous day's picks (win/loss/push)\n"
+            "• 📈 <b>Performance report</b> — periodic stats: win rate, ROI, CLV, Brier score\n\n"
+            "<b>📌 Pick format explained</b>\n"
+            "Each pick shows:\n"
+            "  <code>Match</code> — home vs away team\n"
+            "  <code>Bet</code> — market (Home Win / Over 2.5 / BTTS etc.) @ odds\n"
+            "  <code>EV</code> — expected value (higher = more edge)\n"
+            "  <code>Conf</code> — model confidence %\n"
+            "  <code>Stake</code> — recommended % of bankroll (Kelly-based)\n"
+            "  <code>Models</code> — 🎯 unanimous / ✊ majority / ⚠️ split\n\n"
+            "<b>🌍 Leagues covered (29)</b>\n"
+            "<i>Top 5</i>\n"
+            "🏴 Premier League · 🇪🇸 La Liga · 🇩🇪 Bundesliga · 🇮🇹 Serie A · 🇫🇷 Ligue 1\n\n"
+            "<i>European Competitions</i>\n"
+            "🏆 Champions League · 🏆 Europa League · 🏆 Conference League\n\n"
+            "<i>Strong European</i>\n"
+            "🇳🇱 Eredivisie · 🇵🇹 Primeira Liga · 🇧🇪 Jupiler Pro · 🇹🇷 Super Lig · 🏴 Scottish Prem\n\n"
+            "<i>Nordic</i>\n"
+            "🇩🇰 Superliga · 🇳🇴 Eliteserien · 🇸🇪 Allsvenskan\n\n"
+            "<i>Second Divisions &amp; Smaller Leagues</i>\n"
+            "🏴 Championship · League One · League Two\n"
+            "🇪🇸 La Liga 2 · 🇩🇪 2. Bundesliga · 🇮🇹 Serie B · 🇫🇷 Ligue 2\n"
+            "🇦🇹 Bundesliga · 🇨🇭 Super League · 🇬🇷 Super League · 🇵🇱 Ekstraklasa · 🇷🇴 Liga I\n\n"
+            "<b>⚠️ Disclaimer</b>\n"
+            "These are <b>model-generated suggestions</b>, not financial advice. "
+            "Bet responsibly and only what you can afford to lose. "
+            "Past performance does not guarantee future results.\n\n"
+            "<b>📊 Current stats</b>\n"
+            "Track our live performance in the pinned message above.\n\n"
+            "Good luck! 🍀"
+        )
+        await self._send_message(msg)
+
+    async def send_alert(self, text: str):
+        """Send an alert through the one guaranteed delivery path.
+
+        Stage 14 (DEL-1). This used to call `_send_message`, which has no retry
+        for transient failures and whose entire surface is a `logger.error` that
+        callers discard. On 2026-08-23 an alert fired correctly and its send
+        timed out five seconds later; nobody learned anything.
+
+        Alerts now go through `alert_delivery`, which retries with backoff and
+        writes a `::error::` annotation and a GitHub step summary entry when
+        delivery fails — surfaces that do not depend on Telegram working.
+
+        `_send_message` is kept for RICH messages (picks, reports) that need
+        HTML, chunking and the returned Message object. Alerts are plain text
+        and need none of it, so this is one path for alerts, not two.
+
+        Returns the DeliveryResult so callers can act on a failure instead of
+        assuming success.
+        """
+        if not self.enabled:
+            return None
+
+        import asyncio
+
+        from src.reporting.alert_delivery import deliver_alert
+
+        result = await asyncio.to_thread(
+            deliver_alert, text, token=self.bot_token, chat_id=self.chat_id)
+        if not result.ok:
+            logger.error(
+                f"ALERT NOT DELIVERED after {result.attempts} attempt(s): "
+                f"{result.detail} — surfaced to CI: {result.surfaced}")
+        return result
+
+    @staticmethod
+    def _split_chunks(message: str) -> List[str]:
+        """Paragraph-aligned split. Extracted so the SPLIT can be tested alone.
+
+        Unchanged behaviour: 4000-char passthrough, 3800-char chunk ceiling,
+        break on blank lines. It is a separate function only so a test can
+        assert how many parts a given report produces without sending anything.
+        """
+        if len(message) <= 4000:
+            return [message]
+        parts: List[str] = []
+        chunk = ""
+        for para in message.split("\n\n"):
+            if len(chunk) + len(para) + 2 > 3800:
+                if chunk.strip():
+                    parts.append(chunk)
+                chunk = para
+            else:
+                chunk = chunk + "\n\n" + para if chunk else para
+        if chunk.strip():
+            parts.append(chunk)
+        return parts
+
+    async def _send_chunked(self, message: str, header: str = "",
+                            report: str = "report"):
+        """Send a report, with the SEQUENCE made verifiable. DEL-3.
+
+        THE DEFECT THIS CLOSES. The previous version sent each chunk with
+        `_send_message`, discarded every return value, and returned the LAST
+        chunk's Message. A middle chunk that failed left a hole, the loop
+        carried on, the final chunk succeeded, and the caller received a truthy
+        Message. **A corrupt report was indistinguishable from a complete one**,
+        and on 2026-09-13 that happened for real: send 08:53:09, FAIL 08:53:14,
+        send 08:53:17.
+
+            A DELIVERY IS NOT A SEQUENCE UNTIL SOMETHING CAN TELL THAT A PART
+            IS MISSING.
+
+        Three surfaces, because they fail in different directions:
+
+        * **position markers** ``(2/5)`` — the reader can see a gap themselves;
+        * **an in-stream failure marker** — a hole announces itself AT the hole,
+          which is the only thing that catches a lost MIDDLE chunk, since the
+          stream still ends normally;
+        * **a terminator** on the final part — catches the opposite case, a
+          stream that stops early and would otherwise just look like the end.
+
+        Plus a structured ``REPORT_DELIVERY`` line the audit reads, so a failure
+        is RECORDED rather than inferred from the absence of a success.
+
+        `header` was accepted and silently ignored by every previous version.
+        It is used now: it is what a repeated position marker attaches to.
+        """
+        parts = self._split_chunks(message)
+        n = len(parts)
+        results: List[ChunkOutcome] = []
+        failed: List[int] = []
+        last_msg = None
+        terminator_sent = False
+
+        for i, part in enumerate(parts, 1):
+            text = part
+            if n > 1:
+                text = f"<i>({i}/{n})</i>\n{text}"
+                if i == n:
+                    # Appended to the LAST part rather than sent as its own
+                    # message: a separate terminator costs an extra send and,
+                    # worse, could itself fail and fake a truncation.
+                    text = f"{text}\n\n<i>— end of {html_escape(report)} · {n}/{n} —</i>"
+            out = await self._send_one(text)
+            results.append(out)
+            if out.ok:
+                last_msg = out.message
+                if n > 1 and i == n:
+                    terminator_sent = True
+            else:
+                failed.append(i)
+                if out.attempted and n > 1:
+                    # BEST EFFORT, AND ITS FAILURE IS NOT FATAL. If this send
+                    # also fails the position markers and the missing terminator
+                    # still carry the signal — which is why there are three
+                    # surfaces and not one.
+                    await self._send_one(
+                        f"⚠️ <b>part {i}/{n} of this {html_escape(report)} "
+                        f"FAILED TO SEND</b> — the report above is INCOMPLETE.")
+
+        logger.info(
+            f"REPORT_DELIVERY report={report} chunks={n} "
+            f"sent={sum(1 for r in results if r.ok)} "
+            f"failed={','.join(str(i) for i in failed) if failed else 'none'} "
+            f"terminator={'yes' if (n == 1 and results and results[0].ok) or terminator_sent else 'no'} "
+            f"attempts={sum(r.attempts for r in results)}")
+        if failed:
+            logger.error(
+                f"REPORT INCOMPLETE: {len(failed)} of {n} part(s) of the "
+                f"{report} did not send (parts {failed}). A reader sees a "
+                f"report that ends normally.")
+        return last_msg
+
+    async def _send_one(self, text: str) -> "ChunkOutcome":
+        """One send, WITH retry, and with the three states kept apart.
+
+        `_send_message` returned None for BOTH "Telegram is not configured, so
+        nothing was attempted" and "it was attempted and it failed". That is the
+        same collapse as ``[]`` versus ``None`` in the odds path, and a caller
+        counting failures could not tell a disabled bot from a broken one.
+
+        Retry policy is DEL-1's, imported rather than re-chosen: the alert path
+        already decided 3 attempts with 2s/5s backoff, and a second opinion here
+        would be a second policy to keep in step. The TRANSPORT stays
+        `python-telegram-bot` because rich messages need HTML and the Message
+        object back; only the policy is shared.
+        """
+        from src.reporting.alert_delivery import BACKOFF, MAX_ATTEMPTS, _annotate
+
+        bot = self._get_bot()
+        if not bot or not self.chat_id:
+            logger.warning("Telegram not configured, skipping message")
+            return ChunkOutcome(ok=False, attempted=False, detail="not configured")
+
+        detail = ""
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            msg = await self._send_message(text)
+            if msg is not None:
+                return ChunkOutcome(ok=True, attempted=True, message=msg,
+                                    attempts=attempt)
+            detail = self._last_send_error or "unknown"
+            if attempt < MAX_ATTEMPTS:
+                await asyncio.sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
+        _annotate(f"Telegram report part not delivered after {MAX_ATTEMPTS} "
+                  f"attempt(s): {detail}")
+        return ChunkOutcome(ok=False, attempted=True, attempts=MAX_ATTEMPTS,
+                            detail=detail)
+
+    async def _send_message(self, text: str):
+        """Send a message via Telegram using HTML parse mode. Returns the sent Message object.
+
+        Kept returning Message-or-None so existing callers are unchanged. The
+        reason a None happened is recorded on `self._last_send_error`, which is
+        what `_send_one` reads to tell "not attempted" from "attempted and
+        failed".
+        """
+        self._last_send_error = ""
+        bot = self._get_bot()
+        if not bot or not self.chat_id:
+            logger.warning("Telegram not configured, skipping message")
+            self._last_send_error = "not configured"
+            return None
+
+        try:
+            msg = await bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            logger.info("Telegram message sent")
+            return msg
+        except Exception as e:
+            # Telegram groups silently become supergroups (e.g. when settings
+            # change) and the chat id is REPLACED. Auto-retry with the new id
+            # and warn loudly so the configured id gets updated.
+            new_id = getattr(e, "new_chat_id", None)
+            if new_id:
+                logger.warning(
+                    f"Telegram group migrated: chat id {self.chat_id} -> {new_id}. "
+                    f"Retrying with the new id — UPDATE TELEGRAM_CHAT_ID in the "
+                    f"config/secrets to silence this warning."
+                )
+                self.chat_id = str(new_id)
+                try:
+                    msg = await bot.send_message(
+                        chat_id=self.chat_id, text=text, parse_mode="HTML",
+                    )
+                    logger.info("Telegram message sent (after chat migration)")
+                    return msg
+                except Exception as e2:
+                    logger.error(f"Failed to send after chat migration: {e2}")
+                    self._last_send_error = f"after chat migration: {e2}"
+                    return None
+            logger.error(f"Failed to send Telegram message: {e}")
+            self._last_send_error = f"{type(e).__name__}: {e}"
+            return None
+
+
+def _agreement_icon(agreement: str) -> str:
+    """Map model agreement level to an emoji."""
+    return {
+        "unanimous": "🎯",
+        "majority": "✊",
+        "split": "⚠️",
+    }.get(agreement, "")

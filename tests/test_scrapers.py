@@ -1,0 +1,435 @@
+"""Tests for scraper modules."""
+
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
+
+
+
+class TestAPIFootballScraper:
+    """Tests for API-Football scraper budget helpers."""
+
+    def test_remaining_budget_default(self):
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._daily_limit = 100
+        scraper._requests_today = 0
+        assert scraper.remaining_budget() == 100 - scraper.BUDGET_RESERVE
+
+    def test_remaining_budget_after_requests(self):
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._daily_limit = 100
+        scraper._requests_today = 60
+        assert scraper.remaining_budget() == 100 - 60 - scraper.BUDGET_RESERVE
+
+    def test_remaining_budget_never_negative(self):
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._daily_limit = 100
+        scraper._requests_today = 200
+        assert scraper.remaining_budget() == 0
+
+    def test_fallback_bookmakers_defined(self):
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        assert len(APIFootballScraper._TOP_BOOKMAKERS) >= 3
+        assert len(APIFootballScraper._FALLBACK_BOOKMAKERS) >= 3
+        assert APIFootballScraper._TOP_BOOKMAKERS.isdisjoint(
+            APIFootballScraper._FALLBACK_BOOKMAKERS
+        )
+
+    def test_save_fixture_odds_primary_succeeds(self):
+        """When primary bookmakers return odds, fallback is not called."""
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._logged_unknown_bets = set()
+        calls = []
+        def mock_save(match_id, odds_resp, bookmakers):
+            calls.append(bookmakers)
+            if bookmakers is APIFootballScraper._TOP_BOOKMAKERS:
+                return 5  # primary found odds
+            return 3
+        scraper._save_odds_from_set = mock_save
+        result = scraper._save_fixture_odds(1, [{}])
+        assert result == 5
+        assert len(calls) == 1  # fallback never called
+
+    def test_save_fixture_odds_fallback_triggers(self):
+        """When primary returns 0, fallback tier is tried."""
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._logged_unknown_bets = set()
+        calls = []
+        def mock_save(match_id, odds_resp, bookmakers):
+            calls.append(bookmakers)
+            if bookmakers is APIFootballScraper._TOP_BOOKMAKERS:
+                return 0  # primary has nothing
+            return 4  # fallback finds odds
+        scraper._save_odds_from_set = mock_save
+        result = scraper._save_fixture_odds(1, [{}])
+        assert result == 4
+        assert len(calls) == 2  # both tiers called
+
+
+class TestTeamDedupByApiId:
+    """_get_or_create_team_id must key on API-Football's numeric team id before
+    falling back to name matching — otherwise a name variant from a later
+    response spawns a parallel row and splits the club's history."""
+
+    def _scraper(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from src.data.database import DatabaseManager
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mgr = DatabaseManager(config=SimpleNamespace(
+            database={"sqlite_path": str(tmp_path / "teamdedup_test.db")}
+        ))
+        assert not mgr.is_postgres, "test DB must be SQLite, not production Postgres"
+        mgr.create_tables()
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper.db = mgr
+        return scraper, mgr
+
+    def test_matches_existing_row_by_api_id_despite_name_variant(self, tmp_path, monkeypatch):
+        from src.data.models import Team
+        scraper, mgr = self._scraper(tmp_path, monkeypatch)
+        with mgr.get_session() as s:
+            t = Team(name="Paris Saint-Germain", league="france/ligue-1",
+                     apifootball_team_id=85)
+            s.add(t); s.flush(); existing_id = t.id
+            s.commit()
+        # A later API response names the same club "Paris SG" — must resolve to
+        # the SAME row via api id, not create a second one.
+        got = scraper._get_or_create_team_id("Paris SG", "france/ligue-1",
+                                             apifootball_team_id=85)
+        assert got == existing_id
+        with mgr.get_session() as s:
+            assert s.query(Team).filter_by(apifootball_team_id=85).count() == 1
+
+    def test_two_name_variants_same_api_id_converge_to_one_row(self, tmp_path, monkeypatch):
+        from src.data.models import Team
+        scraper, mgr = self._scraper(tmp_path, monkeypatch)
+        id1 = scraper._get_or_create_team_id("Arsenal", "england/premier-league",
+                                             apifootball_team_id=42)
+        id2 = scraper._get_or_create_team_id("Arsenal FC", "england/premier-league",
+                                             apifootball_team_id=42)
+        assert id1 == id2
+        with mgr.get_session() as s:
+            assert s.query(Team).filter_by(apifootball_team_id=42).count() == 1
+
+    def test_new_api_id_with_namesake_name_creates_new_team_not_absorbed(self, tmp_path, monkeypatch):
+        """A qualifier minnow with its own API id must NOT be fuzzy-matched into a
+        similarly-named club. Real case: Vikingur Reykjavik (Iceland) was absorbed
+        into Viking FK (Norway) because 'viking' is a prefix of 'vikingur'."""
+        from src.data.models import Team
+        scraper, mgr = self._scraper(tmp_path, monkeypatch)
+        with mgr.get_session() as s:
+            s.add(Team(name="Viking", league="norway/eliteserien",
+                       apifootball_team_id=759)); s.commit()
+        got = scraper._get_or_create_team_id(
+            "Vikingur Reykjavik", "europe/champions-league", apifootball_team_id=888)
+        with mgr.get_session() as s:
+            viking = s.query(Team).filter_by(apifootball_team_id=759).one()
+            new = s.query(Team).filter_by(apifootball_team_id=888).one()
+            assert got == new.id and got != viking.id, "must be a NEW team, not Viking FK"
+            assert new.name == "Vikingur Reykjavik"
+
+    def test_exact_name_but_different_api_id_creates_new_team(self, tmp_path, monkeypatch):
+        """Two real clubs can share an exact name (different countries). A
+        different authoritative id must never reuse the existing row."""
+        from src.data.models import Team
+        scraper, mgr = self._scraper(tmp_path, monkeypatch)
+        with mgr.get_session() as s:
+            s.add(Team(name="Telstar", league="netherlands/eredivisie",
+                       apifootball_team_id=604)); s.commit()
+        got = scraper._get_or_create_team_id(
+            "Telstar", "europe/europa-conference-league", apifootball_team_id=999)
+        with mgr.get_session() as s:
+            assert s.query(Team).filter_by(apifootball_team_id=604).one().id != got
+            assert s.query(Team).filter_by(apifootball_team_id=999).one().id == got
+            assert s.query(Team).filter(Team.name == "Telstar").count() == 2
+
+
+class TestFlashscoreResultDedup:
+    """Re-scraped results must UPDATE the existing row, not duplicate it.
+
+    Flashscore result dates fall back to the scrape time when unparseable, so the
+    same finished match re-scraped on later days used to dodge the ±4h dedup and
+    insert a fresh row every day (7,054 such rows / ~15% of results by 2026-08-03)."""
+
+    def _scraper_db(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from src.data.database import DatabaseManager
+        from src.scrapers.flashscore_scraper import FlashscoreScraper
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mgr = DatabaseManager(config=SimpleNamespace(
+            database={"sqlite_path": str(tmp_path / "fs_dedup.db")}))
+        assert not mgr.is_postgres, "test DB must be SQLite, not production Postgres"
+        mgr.create_tables()
+        sc = FlashscoreScraper.__new__(FlashscoreScraper)
+        sc._TEAM_NAME_MAP = {}
+        return sc, mgr
+
+    def _res(self, hg, ag, dt):
+        from datetime import datetime
+        return {"home_team": "Start", "away_team": "Viking",
+                "home_goals": hg, "away_goals": ag, "match_date": dt}
+
+    def test_rescraped_result_updates_not_duplicates(self, tmp_path, monkeypatch):
+        from datetime import datetime
+        from src.data.models import Match
+        sc, mgr = self._scraper_db(tmp_path, monkeypatch)
+        lg = "norway/eliteserien"
+        # Day 1 then 3 later re-scrapes of the SAME match, each with a scrape-time date.
+        for dt in (datetime(2026, 7, 30, 12, 36, 24), datetime(2026, 7, 31, 12, 12, 18),
+                   datetime(2026, 8, 1, 11, 36, 15), datetime(2026, 8, 2, 11, 39, 47)):
+            with mgr.get_session() as s:
+                sc._save_match(s, self._res(0, 3, dt), lg, is_fixture=False)
+                s.commit()
+        with mgr.get_session() as s:
+            assert s.query(Match).count() == 1, "re-scrapes must update, not duplicate"
+            m = s.query(Match).first()
+            assert m.match_date == datetime(2026, 7, 30, 12, 36, 24), "earliest date preserved"
+            assert (m.home_goals, m.away_goals) == (0, 3)
+
+    def test_distinct_opponents_not_merged(self, tmp_path, monkeypatch):
+        from datetime import datetime
+        from src.data.models import Match
+        sc, mgr = self._scraper_db(tmp_path, monkeypatch)
+        lg = "norway/eliteserien"
+        with mgr.get_session() as s:
+            sc._save_match(s, self._res(0, 3, datetime(2026, 7, 30, 12, 0)), lg, is_fixture=False)
+            sc._save_match(s, {"home_team": "Start", "away_team": "Rosenborg",
+                               "home_goals": 1, "away_goals": 1,
+                               "match_date": datetime(2026, 7, 30, 12, 0)}, lg, is_fixture=False)
+            s.commit()
+        with mgr.get_session() as s:
+            assert s.query(Match).count() == 2
+
+    def test_same_fixture_beyond_window_not_merged(self, tmp_path, monkeypatch):
+        """Same ordered pairing months apart = two real matches (next season)."""
+        from datetime import datetime
+        from src.data.models import Match
+        sc, mgr = self._scraper_db(tmp_path, monkeypatch)
+        lg = "norway/eliteserien"
+        with mgr.get_session() as s:
+            sc._save_match(s, self._res(0, 3, datetime(2026, 7, 30, 12, 0)), lg, is_fixture=False)
+            sc._save_match(s, self._res(2, 1, datetime(2026, 10, 20, 12, 0)), lg, is_fixture=False)
+            s.commit()
+        with mgr.get_session() as s:
+            assert s.query(Match).count() == 2
+
+
+class TestInjuryScraper:
+    """Tests for injury scraper."""
+
+    def test_init_without_apifootball(self):
+        from src.scrapers.injury_scraper import InjuryScraper
+        scraper = InjuryScraper(config={}, apifootball=None)
+        assert scraper.apifootball is None
+
+    def test_get_injury_summary_empty(self, tmp_path, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+        from src.data.database import DatabaseManager
+        from src.scrapers.injury_scraper import InjuryScraper
+        # Isolate from the global/production DB. get_injury_summary() queries the
+        # injuries table, so the test DB must have the schema — otherwise SQLite
+        # raises "no such table: injuries" (previously masked because the test
+        # silently used the production Postgres DB, which has the table).
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        mgr = DatabaseManager(config=SimpleNamespace(
+            database={"sqlite_path": str(tmp_path / "injuries_test.db")}
+        ))
+        assert not mgr.is_postgres, "test DB must be SQLite, not production Postgres"
+        mgr.create_tables()
+        scraper = InjuryScraper(config={}, apifootball=None)
+        scraper.db = mgr  # override the global get_db() with the isolated one
+        summary = asyncio.run(scraper.get_injury_summary(team_id=99999))
+        assert summary["total_injured"] == 0
+        assert summary["injuries"] == []
+
+
+class TestOddsQuotaSemaphore:
+    """Story 2.1: verify quota-safe semaphore infrastructure."""
+
+    def _make_scraper(self, requests_today=0):
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._daily_limit = 100
+        scraper._requests_today = requests_today
+        scraper.BUDGET_RESERVE = APIFootballScraper.BUDGET_RESERVE
+        scraper._quota_exhausted = False
+        return scraper
+
+    def test_semaphore_capacity_min_of_budget_and_fixtures(self):
+        """Capacity is always 1 (serial) to stay within API-Football's 10 req/min limit."""
+        scraper = self._make_scraper()
+        sem = scraper._make_odds_semaphore(remaining_budget=10, n_fixtures=49)
+        assert sem._value == 1  # serial — one in-flight request at a time
+
+    def test_semaphore_capacity_limited_by_fixture_count(self):
+        """Capacity is always 1 regardless of fixture count."""
+        scraper = self._make_scraper()
+        sem = scraper._make_odds_semaphore(remaining_budget=49, n_fixtures=3)
+        assert sem._value == 1  # still serial even with 3 fixtures
+
+    def test_semaphore_capacity_floor_when_budget_zero(self):
+        """Capacity floors at 1 when remaining_budget=0 — prevents asyncio.Semaphore(0) hang."""
+        scraper = self._make_scraper()
+        sem = scraper._make_odds_semaphore(remaining_budget=0, n_fixtures=5)
+        assert sem._value == 1
+
+    def test_quota_guard_skips_when_exhausted(self):
+        """When quota is at the safety limit, no HTTP call is made."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+        scraper = self._make_scraper(
+            requests_today=100 - APIFootballScraper.BUDGET_RESERVE
+        )
+        scraper._fetch_fixture_odds = AsyncMock(return_value=[{"bookmakers": []}])
+        sem = asyncio.Semaphore(1)
+
+        result = asyncio.run(scraper._fetch_odds_guarded(sem, 42, 999, "england/premier-league"))
+
+        assert result == (42, None, "england/premier-league")
+        scraper._fetch_fixture_odds.assert_not_called()
+
+    def test_quota_guard_fetches_when_budget_ok(self):
+        """When quota allows, _fetch_fixture_odds is called and result returned."""
+        import asyncio
+        from unittest.mock import AsyncMock
+        scraper = self._make_scraper(requests_today=0)
+        mock_odds = [{"bookmakers": [{"name": "Bet365"}]}]
+        scraper._fetch_fixture_odds = AsyncMock(return_value=mock_odds)
+        sem = asyncio.Semaphore(1)
+
+        result = asyncio.run(scraper._fetch_odds_guarded(sem, 42, 999, "england/premier-league"))
+
+        assert result == (42, mock_odds, "england/premier-league")
+        scraper._fetch_fixture_odds.assert_called_once_with(999)
+
+
+class TestParallelOddsFetch:
+    """Story 2.2: verify asyncio.gather replaces sequential loop in fetch_upcoming_odds."""
+
+    def _make_full_scraper(self, fixture_data):
+        """fixture_data: list of (match_id, apifootball_id, league) tuples.
+        Use 'england/premier-league' — it is in PRIORITY_LEAGUES.
+        """
+        from unittest.mock import MagicMock
+        from src.scrapers.apifootball_scraper import APIFootballScraper
+
+        scraper = APIFootballScraper.__new__(APIFootballScraper)
+        scraper._daily_limit = 100
+        scraper._requests_today = 0
+        scraper._quota_exhausted = False
+        scraper.enabled = True
+        scraper._today_fixture_count = len(fixture_data)
+        scraper._logged_unknown_bets = set()
+
+        # Two sequential get_session() calls inside fetch_upcoming_odds:
+        # 1st: load today's fixtures (.all())
+        # 2nd: count existing odds per fixture (.count())
+        session1 = MagicMock()
+        session1.__enter__ = lambda s: s
+        session1.__exit__ = MagicMock(return_value=False)
+
+        mock_fixtures = []
+        for mid, afid, lg in fixture_data:
+            f = MagicMock()
+            f.id = mid
+            f.apifootball_id = afid
+            f.league = lg
+            mock_fixtures.append(f)
+        session1.query.return_value.filter.return_value.all.return_value = mock_fixtures
+
+        session2 = MagicMock()
+        session2.__enter__ = lambda s: s
+        session2.__exit__ = MagicMock(return_value=False)
+        session2.query.return_value.filter.return_value.count.return_value = 0
+
+        scraper.db = MagicMock()
+        scraper.db.get_session.side_effect = [session1, session2]
+
+        scraper._save_fixture_odds = MagicMock(return_value=1)
+        return scraper
+
+    def test_exception_in_gather_result_is_warned_and_skipped(self):
+        """When one coroutine raises, it is WARNING-logged and skipped; others proceed."""
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        LEAGUE = "england/premier-league"
+        scraper = self._make_full_scraper([
+            (1, 101, LEAGUE),
+            (2, 102, LEAGUE),
+            (3, 103, LEAGUE),
+        ])
+
+        async def _guarded(sem, match_id, fixture_id, league):
+            if fixture_id == 102:
+                raise RuntimeError("network timeout")
+            return (match_id, [{"bookmakers": []}], league)
+
+        scraper._fetch_odds_guarded = AsyncMock(side_effect=_guarded)
+
+        with patch("src.scrapers.apifootball_scraper.logger") as mock_logger:
+            asyncio.run(scraper.fetch_upcoming_odds())
+
+        assert scraper._save_fixture_odds.call_count == 2
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("network timeout" in w for w in warning_calls)
+
+    def test_all_successful_results_save_odds(self):
+        """When all gather results are valid, _save_fixture_odds called for each."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        LEAGUE = "england/premier-league"
+        scraper = self._make_full_scraper([
+            (10, 110, LEAGUE),
+            (11, 111, LEAGUE),
+            (12, 112, LEAGUE),
+        ])
+
+        async def _guarded(sem, match_id, fixture_id, league):
+            return (match_id, [{"bookmakers": []}], league)
+
+        scraper._fetch_odds_guarded = AsyncMock(side_effect=_guarded)
+
+        asyncio.run(scraper.fetch_upcoming_odds())
+
+        assert scraper._save_fixture_odds.call_count == 3
+
+    def test_dispatch_sliced_to_odds_budget(self):
+        """Only odds_budget coroutines are dispatched even if more fixtures exist."""
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        LEAGUE = "england/premier-league"
+        # 5 fixtures but budget forced to 2 by exhausting quota
+        scraper = self._make_full_scraper([
+            (20, 120, LEAGUE),
+            (21, 121, LEAGUE),
+            (22, 122, LEAGUE),
+            (23, 123, LEAGUE),
+            (24, 124, LEAGUE),
+        ])
+        # Set requests_today so only 2 budget slots remain
+        # odds_budget = daily_limit - requests_today - BUDGET_RESERVE - injury_reserve
+        # injury_reserve = min(40, 5+10) = 15
+        # We want odds_budget = 2: requests_today = 100 - 9 - 15 - 2 = 74
+        scraper._requests_today = 74
+
+        calls = []
+
+        async def _guarded(sem, match_id, fixture_id, league):
+            calls.append(fixture_id)
+            return (match_id, [{"bookmakers": []}], league)
+
+        scraper._fetch_odds_guarded = AsyncMock(side_effect=_guarded)
+
+        asyncio.run(scraper.fetch_upcoming_odds())
+
+        assert len(calls) <= 2

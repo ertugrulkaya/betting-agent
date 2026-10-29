@@ -1,0 +1,202 @@
+name: Closing Line Capture
+
+# Stage 6 — the only scheduled job the prospective CLV experiment needs.
+#
+# WHY THIS EXISTS SEPARATELY FROM daily-picks.yml
+#
+# clv.validate_pair rejects any odds snapshot taken more than 180 minutes before
+# kickoff, because that is a pre-match price, not a closing price. The daily
+# pipeline runs at 09:37 UTC and European club matches kick off in the evening,
+# so its odds are 8-10 hours stale by kickoff and every capture would be
+# rejected. Without this job the experiment collects nothing, however long it
+# runs.
+#
+# COST
+#
+# Only leagues with a fixture inside the window AND a pending pick awaiting a
+# closing line are refreshed, subject to a per-league minimum interval and a
+# hard monthly credit budget claimed before any HTTP call. Simulated on
+# production fixture history: ~256 credits/month, worst observed day 46, against
+# a 500-credit free tier.
+#
+# TIMEZONE
+#
+# All cron expressions and all stored timestamps are UTC. Bulgaria observes
+# EET/EEST (UTC+2/+3) and switches on the last Sundays of March and October, so
+# the LOCAL time of these runs shifts by an hour twice a year. Nothing in the
+# logic depends on local time — kickoff comparisons use stored UTC datetimes —
+# so correctness is unaffected; only the convenience of the slots moves. The
+# 2-hourly spread absorbs it, as it absorbs GitHub's scheduler delay (observed
+# 0.5-5.7h on this repo, under the RETIRED pre-08-30 crons).
+
+on:
+  schedule:
+    # Every 2 hours across the window that covers European kickoffs
+    # (~11:00-23:00 UTC) plus a late slot for North/South American fixtures.
+    # Off-hour minute to avoid the top-of-hour scheduling crush.
+    #
+    # Stage 15, L4 (2026-08-25). The 10:47 slot is an ADDITION, not a move.
+    # Moving the 21:17/23:17 runs was considered and rejected: they currently
+    # claim nothing, so removing them saves ZERO credits, and what they cost is
+    # not credits but a schedule shaped by ONE MONTH of ONE SEASON's kickoff
+    # distribution. Winter fixture lists carry late kickoffs. Free in credits is
+    # not free in seasonal robustness, and only the first was in the model.
+    #
+    # WHY 10:47 AND NOT 09:17 OR 10:17. MEASURED 2026-08-25: picks for early
+    # kickoffs are written between 10:07 and 10:32 UTC (daily-picks fires 09:37
+    # and runs Claude's per-match review before saving). At 09:17 ZERO of 54
+    # early-kickoff observations exist yet; at 10:17, 8 of 54. A window that
+    # runs before its input exists finds no pending picks and claims no credits
+    # — it would have measured as "added, 0 credits, 0 observations", which is
+    # indistinguishable from a lever that does not work.
+    #
+    # 10:47 clears the latest observed pick write by 15 minutes and precedes an
+    # 11:00 kickoff by 13. When GitHub's scheduler is late (0.5-5.7h observed under the RETIRED pre-08-30 crons)
+    # this slot degrades to behaving like the 11:17 one, which is the existing
+    # status quo, not a regression.
+    - cron: '47 10 * * *'
+    - cron: '17 11,13,15,17,19,21,23 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Plan only — make no API call and spend no credit'
+        type: boolean
+        default: false
+      window_minutes:
+        description: 'Minutes ahead to look for imminent fixtures'
+        default: ''
+
+concurrency:
+  # Never let two capture runs overlap: both would claim credits for the same
+  # leagues. Queue rather than cancel, so a late run still completes.
+  group: closing-lines
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        # Deliberately minimal: this job never trains, scrapes with a browser or
+        # builds features, so it does not need the full requirements set.
+        #
+        # THE BOUND IS REPEATED HERE BECAUSE THIS STEP DOES NOT READ
+        # requirements.txt. Pinning `sqlalchemy<2.1` in that file on 2026-09-25
+        # would have fixed daily-picks and left THIS workflow — the one that
+        # actually failed, on the 20:28 and 23:51 runs of 09-24 — installing
+        # 2.1.0 bare and failing identically. 2.1 changed the default DBAPI for
+        # a bare `postgresql://` URL to psycopg v3, which is not installed here.
+        #
+        # Keep this in step with requirements.txt; the duplication is the cost
+        # of these jobs installing by name instead of from the file.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints.txt "sqlalchemy>=2.0.0,<2.1" psycopg2-binary aiohttp pyyaml python-dotenv loguru numpy scipy
+
+      - name: Create directories
+        run: mkdir -p data/models logs
+
+      - name: Create config from example
+        run: cp config/config.example.yaml config/config.yaml
+
+      # /v4/sports is free — it does not decrement the quota (x-requests-last: 0)
+      # — so a key-validity check costs nothing and therefore has no reason to be
+      # temporary. It confirms the DEPLOYED secret, not a local file: a rotated
+      # key that never reached GitHub previously surfaced as silent capture
+      # failure, indistinguishable from a budget refusal or from D1's zero rows.
+      # It also gives reconcile() a free, independent reading of x-requests-used
+      # on every run instead of only when a paid request happens to be made.
+      - name: Verify the Odds API key is deployed and live
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          code=$(curl -s -o /tmp/sports.json -D /tmp/sports.hdr \
+                   -w '%{http_code}' \
+                   "https://api.the-odds-api.com/v4/sports?apiKey=$ODDS_API_KEY")
+          used=$(grep -i '^x-requests-used:' /tmp/sports.hdr | tr -d '\r' \
+                   | awk '{print $2}')
+          remaining=$(grep -i '^x-requests-remaining:' /tmp/sports.hdr \
+                   | tr -d '\r' | awk '{print $2}')
+          echo "odds-api status      : $code"
+          echo "x-requests-used      : ${used:-unknown}"
+          echo "x-requests-remaining : ${remaining:-unknown}"
+          if [ "$code" = "401" ]; then
+            echo "::error::The Odds API key is INVALID (401). The deployed" \
+                 "secret is stale or wrong — closing-line capture cannot" \
+                 "work until it is updated."
+            exit 1
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::Unexpected status $code from /v4/sports."
+            exit 1
+          fi
+
+      # Stage 15, L2. WITHOUT THIS THE LEVER IS A NO-OP. This workflow had no
+      # cache step at all, so every run started from a fresh checkout and the
+      # barren-league record was written, used once, and thrown away. Same
+      # restore/save pattern as daily-picks' briefings-sent guard.
+      - name: Restore barren-league record
+        uses: actions/cache/restore@v5
+        with:
+          path: data/odds_barren_leagues.json
+          key: barren-leagues-${{ github.run_id }}
+          restore-keys: |
+            barren-leagues-
+
+      - name: Refresh imminent odds and capture closing lines
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+        run: |
+          ARGS=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.window_minutes }}" ]; then ARGS="$ARGS --window ${{ inputs.window_minutes }}"; fi
+          python -m scripts.refresh_and_capture $ARGS
+
+      # Saved even on failure: a run that recorded three empty fetches and
+      # then died still learned something worth keeping.
+      - name: Save barren-league record
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/odds_barren_leagues.json
+          key: barren-leagues-${{ github.run_id }}
+
+      - name: Report quota and CLV coverage
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+        run: python -m scripts.refresh_and_capture --status
+
+      # ── THE TELEGRAM FAILURE ALERT WAS REMOVED HERE. 2026-10-22. ──────────
+      #
+      # It said "Closing-line capture failed. CLV coverage will have a gap."
+      # That is this run's conclusion and nothing more: it named no action and
+      # the reader could not have taken one, because the window it missed does
+      # not come back.
+      #
+      # WHAT CARRIES IT NOW: GitHub's own notification on the red run, and the
+      # coverage ratchet in `paper_trading_report.py` -- which is the honest
+      # carrier, because it measures the GAP ITSELF
+      # (`CLOSING_COVERAGE_FLOOR`, measured 0.1254 on 2026-10-21) rather than
+      # the fact that one job exited non-zero. A gap that matters shows up
+      # there whether or not any single run went red.
+      #
+      # MEASURED over 2026-09-22..10-22: 2 failures in 120 runs, so this
+      # removal is worth 0.07 Telegram messages/day. It is here for the rule,
+      # not for the volume.

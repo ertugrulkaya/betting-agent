@@ -1,0 +1,640 @@
+"""Poisson distribution model for goal prediction."""
+
+import numpy as np
+from datetime import date
+from scipy.stats import poisson
+from typing import Dict, Tuple
+
+from src.data.database import get_db
+from src.data.match_history import get_completed_matches
+from src.utils.config import get_config
+from src.utils.logger import get_logger
+
+logger = get_logger()
+
+MAX_GOALS = 10  # Maximum goals to consider in probability calculations
+
+# National-team competitions: Poisson strengths are estimated exclusively from
+# international match data so club-league performance does not contaminate WC
+# team ratings.  Qualifiers and friendlies provide the historical depth that
+# WC editions alone cannot (many 2026 finalists missed WC 2022).
+NATIONAL_TEAM_LEAGUES = frozenset({
+    "world/fifa-world-cup",
+    "world/friendlies",
+    "world/wc-qualification-africa",
+    "world/wc-qualification-asia",
+    "world/wc-qualification-concacaf",
+    "world/wc-qualification-europe",
+    "world/wc-qualification-oceania",
+    "world/wc-qualification-south-america",
+    "world/euro-championship",
+    "world/uefa-nations-league",
+    "world/africa-cup-of-nations",
+    "world/asian-cup",
+    "world/copa-america",
+    "world/gold-cup",
+    "world/concacaf-nations-league",
+})
+
+
+class PoissonModel:
+    """Poisson-based goal prediction model with Dixon-Coles correction and time decay.
+
+    Calculates attack/defense strength for each team (with exponential time decay
+    on older matches) and uses a Dixon-Coles corrected Poisson distribution to
+    predict expected goals and match outcome probabilities.
+
+    Key enhancements vs. plain independent Poisson:
+    - **Time decay**: recent matches weighted more heavily (configurable half-life).
+    - **Dixon-Coles correction**: adjusts joint probability of low-scoring outcomes
+      (0-0, 1-0, 0-1, 1-1) using correction factor τ with parameter ρ ≈ -0.13,
+      boosting 0-0 and 1-1 while slightly reducing 1-0 and 0-1 probability.
+    """
+
+    def __init__(self):
+        self.db = get_db()
+        self.config = get_config()
+        self.league_avg_home_goals = 1.5
+        self.league_avg_away_goals = 1.2
+        self._team_strengths = {}
+        self._team_league = {}  # team_id -> league string
+        self._league_avgs = {}  # league -> {"home": float, "away": float}
+        self._league_rhos = {}  # league -> optimized Dixon-Coles rho
+        # National-team-only strength estimates (populated by fit())
+        self._national_team_strengths = {}  # team_id -> {"attack": float, "defense": float}
+        self._national_team_avgs = {}       # league -> {"home": float, "away": float}
+
+    def fit(self, league: str = None, num_matches: int = 5000, as_of_date=None):
+        """Calculate time-decayed attack/defense strength ratings from historical data.
+
+        Applies exponential decay so recent matches count more than older ones.
+        Half-life is configurable via models.strength_half_life_days (default: 180 days).
+
+        Args:
+            league: Optional league filter
+            num_matches: Number of recent matches to use
+            as_of_date: When set, only matches before this date are used.
+                Used by the tuning pipeline to avoid look-ahead leakage when
+                evaluating the model on past picks.
+        """
+        half_life = self.config.get("models.strength_half_life_days", 180)
+        decay_rate = np.log(2) / max(half_life, 1)
+        today = date.today()
+
+        # Egress: this used to be `session.query(Match)` — SELECT matches.*,
+        # all 45 columns (~329 B/row) when the fit reads eight of them. The
+        # rows come from a per-process cache shared with Elo, so the ~10
+        # `predictor.fit()` calls a CI day make cost one fetch per process.
+        matches = get_completed_matches(
+            self.db, league=league, as_of_date=as_of_date,
+            limit=num_matches, newest_first=True,
+        )
+        if not matches:
+            logger.warning("No match data available for Poisson model fitting")
+            return
+
+        # Reset accumulators so a SECOND fit() in the same process starts
+        # clean. Without this, _national_team_avgs still held the collapsed
+        # floats from the prior fit and .append() crashed with
+        # "'float' object has no attribute 'append'" — the tuning pipeline
+        # refits twice (as-of-date, then full data). _team_strengths is
+        # rebuilt by key so it's safe, but the national-team dicts are not.
+        self._national_team_avgs = {}
+        self._national_team_strengths = {}
+
+        # Compute time-decay weight per match
+        def match_weight(m):
+            if m.match_date is None:
+                return 0.1
+            m_date = m.match_date.date() if hasattr(m.match_date, "date") else m.match_date
+            days = max(0, (today - m_date).days)
+            return float(np.exp(-decay_rate * days))
+
+        weights = [match_weight(m) for m in matches]
+
+        # xG mode: use expected goals instead of raw goals when available.
+        # Falls back to raw goals for matches without xG data.
+        use_xg = self.config.get("models.poisson_use_xg", True)
+        xg_min_coverage = self.config.get("models.poisson_xg_min_coverage", 0.50)
+        xg_available = sum(1 for m in matches if m.home_xg is not None and m.home_xg > 0)
+        xg_fraction = xg_available / len(matches) if matches else 0
+        use_xg_global = use_xg and xg_fraction >= xg_min_coverage
+
+        def _goal_value(match, side_goals, side_xg):
+            """Return xG if available and enabled, else raw goals."""
+            if use_xg_global and side_xg is not None and side_xg > 0:
+                return side_xg
+            return side_goals
+
+        # Weighted global averages
+        home_goals_arr = np.array(
+            [_goal_value(m, m.home_goals, m.home_xg) for m in matches], dtype=float
+        )
+        away_goals_arr = np.array(
+            [_goal_value(m, m.away_goals, m.away_xg) for m in matches], dtype=float
+        )
+        w = np.array(weights)
+        w_sum = w.sum()
+        if w_sum > 0:
+            self.league_avg_home_goals = float(np.dot(w, home_goals_arr) / w_sum)
+            self.league_avg_away_goals = float(np.dot(w, away_goals_arr) / w_sum)
+        else:
+            self.league_avg_home_goals = float(np.mean(home_goals_arr))
+            self.league_avg_away_goals = float(np.mean(away_goals_arr))
+
+        # Weighted per-league averages for calibration
+        league_goals: dict = {}
+        for m, wt in zip(matches, weights):
+            lg = m.league or "unknown"
+            league_goals.setdefault(lg, {"home": [], "away": [], "w": []})
+            league_goals[lg]["home"].append(_goal_value(m, m.home_goals, m.home_xg))
+            league_goals[lg]["away"].append(_goal_value(m, m.away_goals, m.away_xg))
+            league_goals[lg]["w"].append(wt)
+        for lg, gdata in league_goals.items():
+            if len(gdata["home"]) >= 30:
+                lw = np.array(gdata["w"])
+                lw_sum = lw.sum()
+                if lw_sum > 0:
+                    self._league_avgs[lg] = {
+                        "home": float(np.dot(lw, gdata["home"]) / lw_sum),
+                        "away": float(np.dot(lw, gdata["away"]) / lw_sum),
+                    }
+
+        # Per-team attack and defense strengths (time-weighted)
+        team_stats: dict = {}
+        for match, wt in zip(matches, weights):
+            h_scored = _goal_value(match, match.home_goals, match.home_xg)
+            a_scored = _goal_value(match, match.away_goals, match.away_xg)
+            for team_id, scored, conceded, venue in [
+                (match.home_team_id, h_scored, a_scored, "home"),
+                (match.away_team_id, a_scored, h_scored, "away"),
+            ]:
+                if match.league:
+                    self._team_league[team_id] = match.league
+                if team_id not in team_stats:
+                    team_stats[team_id] = {
+                        "home_scored": [], "home_conceded": [],
+                        "away_scored": [], "away_conceded": [],
+                        "home_w": [], "away_w": [],
+                    }
+                team_stats[team_id][f"{venue}_scored"].append(scored)
+                team_stats[team_id][f"{venue}_conceded"].append(conceded)
+                team_stats[team_id][f"{venue}_w"].append(wt)
+
+        def _wavg(vals, wts, fallback):
+            if not vals:
+                return fallback
+            wts_arr = np.array(wts)
+            ws = wts_arr.sum()
+            if ws <= 0:
+                return float(np.mean(vals))
+            return float(np.dot(wts_arr, vals) / ws)
+
+        for team_id, stats in team_stats.items():
+            home_scored_avg = _wavg(stats["home_scored"], stats["home_w"], self.league_avg_home_goals)
+            away_scored_avg = _wavg(stats["away_scored"], stats["away_w"], self.league_avg_away_goals)
+            home_conceded_avg = _wavg(stats["home_conceded"], stats["home_w"], self.league_avg_away_goals)
+            away_conceded_avg = _wavg(stats["away_conceded"], stats["away_w"], self.league_avg_home_goals)
+
+            attack_strength = (
+                (home_scored_avg / self.league_avg_home_goals) +
+                (away_scored_avg / self.league_avg_away_goals)
+            ) / 2
+
+            defense_strength = (
+                (home_conceded_avg / self.league_avg_away_goals) +
+                (away_conceded_avg / self.league_avg_home_goals)
+            ) / 2
+
+            # Bayesian shrinkage: regress toward league-average (1.0) for
+            # teams with few observations.  A team with < shrinkage_cap
+            # matches is pulled toward the prior proportionally.
+            shrinkage_cap = self.config.get("models.shrinkage_sample_cap", 100)
+            total_matches = (len(stats["home_scored"])
+                             + len(stats["away_scored"]))
+            shrinkage = min(total_matches, shrinkage_cap) / shrinkage_cap
+            attack_strength = attack_strength * shrinkage + 1.0 * (1 - shrinkage)
+            defense_strength = defense_strength * shrinkage + 1.0 * (1 - shrinkage)
+
+            # Floor to prevent zero xG (e.g. team conceded 0 in small sample)
+            self._team_strengths[team_id] = {
+                "attack": max(attack_strength, 0.15),
+                "defense": max(defense_strength, 0.15),
+            }
+
+        # ----------------------------------------------------------------
+        # Separate national-team strength estimation
+        # Use ONLY international match data so that WC predictions are
+        # calibrated on international form, not club-league performance.
+        # ----------------------------------------------------------------
+        nat_matches_raw = [
+            (m, w) for m, w in zip(matches, weights)
+            if m.league in NATIONAL_TEAM_LEAGUES
+        ]
+        if nat_matches_raw:
+            nat_home_arr = np.array([
+                _goal_value(m, m.home_goals, m.home_xg) for m, _ in nat_matches_raw
+            ])
+            nat_away_arr = np.array([
+                _goal_value(m, m.away_goals, m.away_xg) for m, _ in nat_matches_raw
+            ])
+            nat_w = np.array([w for _, w in nat_matches_raw])
+            nat_w_sum = nat_w.sum()
+            if nat_w_sum > 0:
+                nat_avg_home = float(np.dot(nat_w, nat_home_arr) / nat_w_sum)
+                nat_avg_away = float(np.dot(nat_w, nat_away_arr) / nat_w_sum)
+            else:
+                nat_avg_home = float(np.mean(nat_home_arr)) if len(nat_home_arr) else 1.4
+                nat_avg_away = float(np.mean(nat_away_arr)) if len(nat_away_arr) else 1.1
+
+            # Per-league averages for national team competitions
+            for m, wt in nat_matches_raw:
+                lg = m.league
+                self._national_team_avgs.setdefault(lg, {"home": [], "away": [], "w": []})
+                self._national_team_avgs[lg]["home"].append(
+                    _goal_value(m, m.home_goals, m.home_xg))
+                self._national_team_avgs[lg]["away"].append(
+                    _goal_value(m, m.away_goals, m.away_xg))
+                self._national_team_avgs[lg]["w"].append(wt)
+            # Collapse lists → weighted averages
+            for lg, gdata in self._national_team_avgs.items():
+                if isinstance(gdata["home"], list) and gdata["home"]:
+                    lw = np.array(gdata["w"])
+                    lw_sum = lw.sum()
+                    if lw_sum > 0:
+                        self._national_team_avgs[lg] = {
+                            "home": float(np.dot(lw, gdata["home"]) / lw_sum),
+                            "away": float(np.dot(lw, gdata["away"]) / lw_sum),
+                        }
+
+            nat_team_stats: dict = {}
+            for m, wt in nat_matches_raw:
+                h_scored = _goal_value(m, m.home_goals, m.home_xg)
+                a_scored = _goal_value(m, m.away_goals, m.away_xg)
+                for team_id, scored, conceded, venue in [
+                    (m.home_team_id, h_scored, a_scored, "home"),
+                    (m.away_team_id, a_scored, h_scored, "away"),
+                ]:
+                    if team_id not in nat_team_stats:
+                        nat_team_stats[team_id] = {
+                            "home_scored": [], "home_conceded": [],
+                            "away_scored": [], "away_conceded": [],
+                            "home_w": [], "away_w": [],
+                        }
+                    nat_team_stats[team_id][f"{venue}_scored"].append(scored)
+                    nat_team_stats[team_id][f"{venue}_conceded"].append(conceded)
+                    nat_team_stats[team_id][f"{venue}_w"].append(wt)
+
+            shrinkage_cap = self.config.get("models.shrinkage_sample_cap", 100)
+            for team_id, stats in nat_team_stats.items():
+                hs_avg = _wavg(stats["home_scored"], stats["home_w"], nat_avg_home)
+                as_avg = _wavg(stats["away_scored"], stats["away_w"], nat_avg_away)
+                hc_avg = _wavg(stats["home_conceded"], stats["home_w"], nat_avg_away)
+                ac_avg = _wavg(stats["away_conceded"], stats["away_w"], nat_avg_home)
+                atk = ((hs_avg / max(nat_avg_home, 0.01)) +
+                       (as_avg / max(nat_avg_away, 0.01))) / 2
+                dfn = ((hc_avg / max(nat_avg_away, 0.01)) +
+                       (ac_avg / max(nat_avg_home, 0.01))) / 2
+                total_m = len(stats["home_scored"]) + len(stats["away_scored"])
+                shrink = min(total_m, shrinkage_cap) / shrinkage_cap
+                atk = atk * shrink + 1.0 * (1 - shrink)
+                dfn = dfn * shrink + 1.0 * (1 - shrink)
+                self._national_team_strengths[team_id] = {
+                    "attack": max(atk, 0.15),
+                    "defense": max(dfn, 0.15),
+                }
+            logger.info(
+                f"National-team Poisson strengths fitted: "
+                f"{len(self._national_team_strengths)} teams from "
+                f"{len(nat_matches_raw)} international matches"
+            )
+
+        # Per-league Dixon-Coles rho via MLE — OFF by default since 2026-08-07.
+        #
+        # The correction is designed to fix the low-score cells, so it was worth
+        # measuring on the market it targets. Walk-forward over 5,771 matches:
+        # Over/Under 2.5 log-loss was 0.7083 at rho=-0.13 and 0.7084 at rho=0 —
+        # indistinguishable. On 1X2 it is actively harmful: rho=0 beat every
+        # negative rho at every half-life tested. Meanwhile this routine runs a
+        # scipy.optimize.minimize_scalar over every league x every match, calling
+        # poisson.pmf inside the objective, on every fit() — and there are ~10
+        # fits a CI day.
+        #
+        # Re-enable with models.dc_rho_per_league: true if a future evaluation
+        # finds a market where it pays.
+        if self.config.get("models.dc_rho_per_league", False):
+            self._estimate_league_rhos(matches)
+
+        xg_label = f"xG mode ({xg_available}/{len(matches)} matches)" if use_xg_global else "raw goals"
+        logger.info(
+            f"Poisson model fitted: {len(self._team_strengths)} teams, "
+            f"{len(self._league_avgs)} leagues calibrated, "
+            f"{len(self._league_rhos)} per-league rhos estimated, "
+            f"avg home goals={self.league_avg_home_goals:.2f}, "
+            f"avg away goals={self.league_avg_away_goals:.2f} "
+            f"(time-decay half-life={half_life}d, {xg_label})"
+        )
+
+    def _estimate_league_rhos(self, matches):
+        """Estimate per-league Dixon-Coles rho via maximum likelihood.
+
+        For each league with enough matches, grid-searches the rho value in
+        [-0.25, 0.05] that maximises the log-likelihood of observed scores
+        given each team's Poisson xG.
+        """
+        from scipy.optimize import minimize_scalar
+
+        min_matches = self.config.get("models.dc_rho_min_matches", 50)
+        default_rho = self.config.get("models.dixon_coles_rho", -0.13)
+
+        # Group matches by league
+        league_matches: dict = {}
+        for m in matches:
+            lg = m.league or "unknown"
+            league_matches.setdefault(lg, []).append(m)
+
+        for lg, lg_matches in league_matches.items():
+            if len(lg_matches) < min_matches:
+                continue
+
+            # Pre-compute xG for each match (need both team strengths known)
+            match_data = []
+            for m in lg_matches:
+                hs = self._team_strengths.get(m.home_team_id)
+                aws = self._team_strengths.get(m.away_team_id)
+                if hs is None or aws is None:
+                    continue
+                home_xg, away_xg = self._expected_goals(m.home_team_id, m.away_team_id)
+                if home_xg <= 0 or away_xg <= 0:
+                    continue
+                match_data.append((m.home_goals, m.away_goals, home_xg, away_xg))
+
+            if len(match_data) < min_matches:
+                continue
+
+            def neg_log_likelihood(rho):
+                ll = 0.0
+                for hg, ag, lam, mu in match_data:
+                    # Independent Poisson probability
+                    p = poisson.pmf(hg, lam) * poisson.pmf(ag, mu)
+                    # Dixon-Coles correction
+                    tau = self._dc_tau(hg, ag, lam, mu, rho)
+                    p *= tau
+                    if p > 0:
+                        ll += np.log(p)
+                    else:
+                        ll += -50  # penalty for zero probability
+                return -ll
+
+            try:
+                result = minimize_scalar(
+                    neg_log_likelihood,
+                    bounds=(-0.25, 0.0),
+                    method="bounded",
+                )
+                if result.success:
+                    rho_val = round(float(result.x), 4)
+                    # Clamp to non-positive: DC correction should reduce
+                    # low-score probabilities, not increase them.
+                    self._league_rhos[lg] = min(rho_val, 0.0)
+                else:
+                    self._league_rhos[lg] = default_rho
+            except Exception:
+                self._league_rhos[lg] = default_rho
+
+        if self._league_rhos:
+            logger.debug(f"Per-league DC rhos: {self._league_rhos}")
+
+    def predict(self, home_team_id: int, away_team_id: int,
+                league: str = None) -> Dict:
+        """Predict match outcomes using Poisson model.
+
+        Args:
+            home_team_id: Home team database ID
+            away_team_id: Away team database ID
+
+        Returns:
+            Dictionary with predicted probabilities for all markets
+        """
+        # Resolve league from team mapping if not provided
+        if league is None:
+            league = self._team_league.get(
+                home_team_id, self._team_league.get(away_team_id))
+
+        home_xg, away_xg = self._expected_goals(home_team_id, away_team_id, league=league)
+
+        # Score probability matrix (with Dixon-Coles correction applied)
+        score_matrix = self._score_matrix(home_xg, away_xg, league=league)
+
+        # Market probabilities
+        home_win_prob = np.sum(np.tril(score_matrix, -1))
+        draw_prob = np.sum(np.diag(score_matrix))
+        away_win_prob = np.sum(np.triu(score_matrix, 1))
+
+        # Over/Under (match total). Over 0.5 is omitted here — as a MATCH total it
+        # is a ~94% near-certainty; "over 0.5" is only meaningful per TEAM (below).
+        over_25_prob = self._over_under_prob(score_matrix, 2.5)
+        over_15_prob = self._over_under_prob(score_matrix, 1.5)
+        over_35_prob = self._over_under_prob(score_matrix, 3.5)
+        over_45_prob = self._over_under_prob(score_matrix, 4.5)
+
+        # BTTS
+        btts_prob = self._btts_prob(score_matrix)
+
+        # Team goal lines. Over 0.5 = P(team scores at least once) = "team to score".
+        home_over_05 = self._team_over_prob(score_matrix, 0.5, side="home")
+        away_over_05 = self._team_over_prob(score_matrix, 0.5, side="away")
+        home_over_15 = self._team_over_prob(score_matrix, 1.5, side="home")
+        away_over_15 = self._team_over_prob(score_matrix, 1.5, side="away")
+
+        return {
+            "home_xg": round(home_xg, 3),
+            "away_xg": round(away_xg, 3),
+            "home_win": round(home_win_prob, 4),
+            "draw": round(draw_prob, 4),
+            "away_win": round(away_win_prob, 4),
+            "over_1.5": round(over_15_prob, 4),
+            "over_2.5": round(over_25_prob, 4),
+            "over_3.5": round(over_35_prob, 4),
+            "over_4.5": round(over_45_prob, 4),
+            "under_2.5": round(1 - over_25_prob, 4),
+            "btts_yes": round(btts_prob, 4),
+            "btts_no": round(1 - btts_prob, 4),
+            "home_over_0.5": round(home_over_05, 4),
+            "away_over_0.5": round(away_over_05, 4),
+            "home_over_1.5": round(home_over_15, 4),
+            "away_over_1.5": round(away_over_15, 4),
+            "most_likely_score": self._most_likely_score(score_matrix),
+            "model": "poisson",
+        }
+
+    def _expected_goals(
+        self,
+        home_team_id: int,
+        away_team_id: int,
+        league: str = None,
+    ) -> Tuple[float, float]:
+        """Calculate expected goals for each team.
+
+        For national-team competitions (world/fifa-world-cup) the dedicated
+        `_national_team_strengths` dict is used so international form drives
+        the estimate rather than club-league performance.
+
+        For unknown teams, regress toward league average with slight randomisation
+        based on the team ID so that different unknown teams still get different
+        predictions instead of all converging to the same xG.
+        """
+        is_national = league in NATIONAL_TEAM_LEAGUES if league else False
+
+        if is_national and self._national_team_strengths:
+            # Prefer national-team-specific strengths; fall back to global if unseen
+            home_strength = (
+                self._national_team_strengths.get(home_team_id)
+                or self._team_strengths.get(home_team_id)
+            )
+            away_strength = (
+                self._national_team_strengths.get(away_team_id)
+                or self._team_strengths.get(away_team_id)
+            )
+        else:
+            home_strength = self._team_strengths.get(home_team_id)
+            away_strength = self._team_strengths.get(away_team_id)
+
+        if home_strength is None:
+            # Small deterministic offset so different unknown teams differ
+            seed = (home_team_id * 2654435761) & 0xFFFFFFFF
+            offset = ((seed % 1000) / 1000.0 - 0.5) * 0.3  # -0.15..+0.15
+            home_strength = {"attack": 1.0 + offset, "defense": 1.0 - offset * 0.5}
+
+        if away_strength is None:
+            seed = (away_team_id * 2654435761) & 0xFFFFFFFF
+            offset = ((seed % 1000) / 1000.0 - 0.5) * 0.3
+            away_strength = {"attack": 1.0 + offset, "defense": 1.0 - offset * 0.5}
+
+        # Use per-league averages when available.
+        # For national team competitions, prefer the dedicated national_team_avgs.
+        if is_national and league in self._national_team_avgs:
+            avg_home = self._national_team_avgs[league]["home"]
+            avg_away = self._national_team_avgs[league]["away"]
+        else:
+            home_lg = self._team_league.get(home_team_id)
+            away_lg = self._team_league.get(away_team_id)
+            eff_lg = league or (home_lg if home_lg == away_lg else None)
+            if eff_lg and eff_lg in self._league_avgs:
+                avg_home = self._league_avgs[eff_lg]["home"]
+                avg_away = self._league_avgs[eff_lg]["away"]
+            else:
+                avg_home = self.league_avg_home_goals
+                avg_away = self.league_avg_away_goals
+
+        home_xg = avg_home * home_strength["attack"] * away_strength["defense"]
+        away_xg = avg_away * away_strength["attack"] * home_strength["defense"]
+
+        return home_xg, away_xg
+
+    def _dc_tau(self, x: int, y: int, lam: float, mu: float, rho: float) -> float:
+        """Dixon-Coles low-score correction factor τ(x, y).
+
+        Adjusts the joint probability of low-scoring outcomes to correct the
+        known under-estimation of 0-0 and 1-1 results by independent Poisson.
+
+        Reference: Dixon & Coles (1997), "Modelling Association Football Scores
+        and Inefficiencies in the Football Betting Market."
+
+        With ρ < 0 (e.g. -0.13):
+          - τ(0,0) > 1  — 0-0 draws are more likely than independent Poisson predicts
+          - τ(1,1) > 1  — 1-1 draws are more likely
+          - τ(1,0) < 1  — 1-0 home wins are slightly less likely
+          - τ(0,1) < 1  — 0-1 away wins are slightly less likely
+
+        Result is clamped to [0.01, ∞) to prevent negative probabilities
+        when per-league MLE produces unusual rho values.
+        """
+        if x == 0 and y == 0:
+            tau = 1.0 - lam * mu * rho
+        elif x == 0 and y == 1:
+            tau = 1.0 + lam * rho
+        elif x == 1 and y == 0:
+            tau = 1.0 + mu * rho
+        elif x == 1 and y == 1:
+            tau = 1.0 - rho
+        else:
+            return 1.0
+        return max(tau, 0.01)
+
+    def _score_matrix(self, home_xg: float, away_xg: float,
+                      league: str = None) -> np.ndarray:
+        """Generate a probability matrix for all scoreline combinations.
+
+        Applies Dixon-Coles correction to low-scoring outcomes to address the
+        known under-estimation of 0-0 and 1-1 by the independent Poisson model.
+        Uses per-league rho when available, falls back to global config.
+        Set models.dixon_coles_rho=0.0 in config to disable the correction.
+        """
+        home_probs = [poisson.pmf(i, home_xg) for i in range(MAX_GOALS)]
+        away_probs = [poisson.pmf(i, away_xg) for i in range(MAX_GOALS)]
+        matrix = np.outer(home_probs, away_probs)
+
+        default_rho = self.config.get("models.dixon_coles_rho", -0.13)
+        rho = self._league_rhos.get(league, default_rho) if league else default_rho
+        if rho != 0.0:
+            # Apply correction to the 4 low-score cells
+            for i in range(min(2, MAX_GOALS)):
+                for j in range(min(2, MAX_GOALS)):
+                    matrix[i, j] *= self._dc_tau(i, j, home_xg, away_xg, rho)
+            # Renormalize so probabilities still sum to 1
+            total = matrix.sum()
+            if total > 0:
+                matrix /= total
+
+        return matrix
+
+    def _over_under_prob(self, matrix: np.ndarray, threshold: float) -> float:
+        """Calculate probability of total goals being over a threshold."""
+        prob = 0.0
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                if i + j > threshold:
+                    prob += matrix[i][j]
+        return prob
+
+    def _team_over_prob(self, matrix: np.ndarray, threshold: float,
+                        side: str = "home") -> float:
+        """Calculate probability that a specific team scores more than threshold goals.
+
+        Args:
+            matrix: Score probability matrix (home goals × away goals)
+            threshold: Goal threshold (e.g. 1.5 means the team scores 2+)
+            side: 'home' or 'away'
+        """
+        prob = 0.0
+        if side == "home":
+            for i in range(matrix.shape[0]):
+                if i > threshold:
+                    prob += float(np.sum(matrix[i, :]))
+        else:
+            for j in range(matrix.shape[1]):
+                if j > threshold:
+                    prob += float(np.sum(matrix[:, j]))
+        return prob
+
+    def _btts_prob(self, matrix: np.ndarray) -> float:
+        """Calculate probability of both teams scoring."""
+        # Exclude rows/cols where either team scores 0
+        return float(np.sum(matrix[1:, 1:]))
+
+    def _most_likely_score(self, matrix: np.ndarray) -> str:
+        """Most likely scoreline = each team's most likely goal count (marginal modes).
+
+        NOT the argmax joint cell: the Dixon-Coles low-score correction (rho<0)
+        inflates the 1-1 and 0-0 cells, so the single most-probable EXACT score is
+        often a draw even for a heavy favourite (France 80% to win showed "1-1").
+        That contradicts the win% and xG and confuses readers. The marginal modes
+        — most likely home goals × most likely away goals — track the xG and the
+        favourite (France xG 2.0 / Iraq 1.0 → "2-0"), which is what people expect
+        from a "most likely score" line. Aggregate markets (1X2/O-U/BTTS) still use
+        the full DC matrix; only this display value changes.
+        """
+        home_mode = int(np.argmax(matrix.sum(axis=1)))  # most likely home goals
+        away_mode = int(np.argmax(matrix.sum(axis=0)))   # most likely away goals
+        return f"{home_mode}-{away_mode}"

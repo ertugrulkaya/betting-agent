@@ -1,0 +1,843 @@
+name: Daily Betting Picks
+
+on:
+  schedule:
+    # One daily run. The WC (which forced a 16:00-UTC kickoff deadline and a
+    # second "backup" cron to survive GitHub's 0.5-5.7h scheduler delays, a figure
+    # from the RETIRED pre-08-30 regime) is
+    # over; club matches kick off in the evening, hours after this ~11:00-UTC
+    # run finishes even when the scheduler is late — so a single run has ample
+    # buffer and the backup cron was removed (2026-07-22). Off-hour minute
+    # dodges top-of-hour congestion. Manual re-runs available via dispatch.
+    # STAGE 21. 09:37 -> 03:00 UTC (06:00 Sofia).
+    #
+    # 09:37 was already near-optimal for a ZERO-delay world: the earliest
+    # kickoff in the active league set is 10:04 UTC (Sunday p05 = 10:06), and a
+    # ~20-minute run starting at 09:37 finishes before it. The problem was never
+    # the hour — it was that GitHub's scheduler has delivered 0.5h to 11h21m of
+    # delay, and a late start cannot be recovered.
+    #
+    # ── THE ENVELOPE, RE-ATTRIBUTED. THE CANONICAL STATEMENT. ───────────────
+    #
+    # EVERY DELAY FIGURE CARRIES THE CRON IT WAS MEASURED UNDER. A figure without
+    # its regime gets re-pooled within a month; that has already happened twice —
+    # once when `0.5h-11h21m` was cited as this cron's envelope, and once when a
+    # 09:37 run (`390a4be`) read as an 11h30m outlier of a 03:00 series.
+    #
+    # Measured 2026-10-02, membership by each run's OWN headSha:
+    #
+    #   cron           n    min      max      mean     sd        regime
+    #   -----------  ---  -------  -------  -------  -------  -----------------
+    #   37 9 * * *    39   0h17m   11h21m    1h53m   143.9m   retired 2026-08-30
+    #   0 3 * * *     32   4h11m    6h35m    5h03m    36.7m   retired 2026-10-01
+    #   0 0 * * *      1   4h15m    4h15m    4h15m      n/a   CURRENT
+    #
+    # SO `11h21m` BELONGS TO `37 9 * * *` AND TO NOTHING ELSE. The `0 3 * * *`
+    # regime's measured maximum was 6h35m — 4h46m below it — and the current
+    # cron has n=1, which supports no distributional claim at all. The retrospective
+    # reconstruction is what made this visible, and `headSha` membership is why
+    # it was possible: without it the three populations are one series with a
+    # 143.9-minute sd and no structure.
+    #
+    # `0.5-5.7h` appears elsewhere in this repository and belongs to the same
+    # retired pre-08-30 pool. It is not this cron's envelope either.
+    #
+    # MEASURED FOR THIS CRON, 2026-10-01, n=32, membership by each run's OWN
+    # headSha carrying exactly `0 3 * * *` (which excludes 390a4be, a 09:37 run
+    # that would otherwise have read as an 11h30m outlier):
+    #
+    #   min 4h11m · max 6h35m · mean 5h03m · median 5h02m · sd 36.7m · spread 143m
+    #
+    # AND IT IS DRIFTING, measured 2026-10-01: a linear fit on the n=32 series
+    # gives +2.585 min/day (+18.1 min/week), R^2 = 0.451 — a real trend, noisy.
+    # 09-28, 09-29, 09-30 and 10-01 came in at 6h05m, 6h15m, 6h07m and 6h35m,
+    # four consecutive days above the prior 28-day maximum of 6h02m. A shift,
+    # not an outlier.
+    #
+    # STAGE 22 (2026-10-01). 03:00 -> 00:00 UTC, and the two numbers the old
+    # block asserted were both WRONG. Every figure below is measured on this
+    # date and labelled; a number in a comment is `assumed` until re-measured.
+    #
+    #   earliest kickoff  10:15 UTC, NOT 10:04. Measured over 1666 fixtures in
+    #                     the 30 tracked leagues, 2026-08-01..09-20, AFTER
+    #                     discarding 419 rows whose match_date carries
+    #                     sub-second precision — those are ingestion timestamps,
+    #                     not kickoffs, and 10:04 was one of them. Only Sat/Sun
+    #                     have morning kickoffs (10:15); Mon-Fri earliest is
+    #                     14:30. The binding case is the WEEKEND.
+    #   latest kickoff    19:45 UTC, NOT 19:30 (Mon 09-14, Wed 09-16). The
+    #                     per-weekday spread is 15 minutes, so a single cron is
+    #                     the right instrument for the lower edge.
+    #   time to picks     67.4-88.1 min on a FULL card (n=4), mean 76.4, sd 10.2,
+    #                     mean+3sd 107.0. The old block assumed "a ~20-minute
+    #                     run" and derived a 09:45 start deadline from it. That
+    #                     deadline was never measured and was wrong by 3-4x.
+    #   settlement        19:45 + 115m match + 120m publication [ASSUMED] = the
+    #                     floor is 23:40 on day D. DOES NOT BIND: the MINIMUM
+    #                     observed delay is 4h11m, so a 00:00 cron starts no
+    #                     earlier than 04:11 and clears the floor by 271 min.
+    #                     The publication figure would have to be 511 min rather
+    #                     than 120 before it could bind, so it is not worth
+    #                     re-measuring.
+    #   odds availability unchanged from 2026-08-30 and still non-binding:
+    #                     9 of 10 fixtures are priced >=24h before kickoff.
+    #
+    # SO THE DEADLINE IS A MEASURED 08:28-08:47 UTC (10:15 minus full-card
+    # mean+3sd / max), and 03:00 sat 67-85 MINUTES PAST IT. 00:00 restores:
+    #
+    #   delay max 6h35m      -> start 06:35, picks 08:22, margin +112 min
+    #   delay mean+3sd 6h53m -> start 06:53, picks 08:40, margin  +94 min
+    #
+    # DATE SAFETY, the whole risk of moving across midnight. Execution stays on
+    # the SAME calendar day for both crons (00:00 + 11h21m, the largest delay
+    # ever documented in ANY regime — it belongs to the retired `37 9 * * *`,
+    # ever documented, is 11:21 the same day), and 00:00 has 24h of headroom
+    # before a crossing against 03:00's 21h — the move is STRICTLY MORE
+    # date-robust. Every clock-derived site was enumerated and none changes:
+    # the card's date, the settlement target, the credits period, the run marker
+    # (briefings_sent.json, keyed by date.today()), the audit window and
+    # max_days_ahead's cutoff. The now-relative ones are invariant because the
+    # execution band moves through [04:11, 07:11), which contains ZERO kickoffs
+    # in 37,709 tracked rows.
+    #
+    # WHAT IT DOES NOT FIX: +94 min is consumed by the measured drift around
+    # 2026-11-06 (projected, R^2=0.451). That is the trigger for the next
+    # decision, and the pipeline split — withdrawn here as unnecessary — is the
+    # instrument then. OPS-3 stays open.
+    #
+    # ── SPLIT BY DAY OF WEEK, 2026-10-10 ───────────────────────────────────
+    #
+    # NIKI ASKED FOR ~1h30 LATER. A FLAT SHIFT IS THE WORSE OF TWO OPTIONS,
+    # because THE DEADLINE IS THE EARLIEST KICKOFF AND IT DIFFERS BY DAY.
+    # Measured 2026-10-10 against an INDEPENDENT reference (Flashscore fixtures
+    # pages, probed with max_days_ahead=8, converted from Europe/Kyiv to UTC
+    # after verifying the offset against the production `matches` table):
+    #
+    #     weekend earliest kickoff   10:15 UTC  (Sun 10-11, Sun 10-18)
+    #                                10:30 UTC  (Sat 10-10, Sat 10-17)
+    #     weekday earliest kickoff   12:00 UTC  (Mon 10-12)   <- BINDING
+    #                                15:00 UTC  (Fri 10-16)
+    #                                16:45 UTC  (Tue/Wed/Thu)
+    #
+    # THE REFERENCE DOES NOT REPRODUCE THE 14:30 UTC FIGURE ON FILE. It gives
+    # 12:00 UTC for the binding weekday, 2h30 EARLIER and therefore stricter,
+    # so 12:00 is what the weekday cron is sized against. A figure verified
+    # against the data that produced it is not verified.
+    #
+    # MINIMUM ACCEPTABLE MARGIN, STATED BEFORE COMPUTING: 60 minutes on
+    # mean+3sd against the day type's own deadline. The old 30-minute trigger
+    # was set against a single deadline; 60 is ~3sd of the measured delay
+    # (18.2 min) plus room for the run-duration spread (29-72 min).
+    #
+    # MEASURED LATENESS, regime `0 0 * * *`, scheduled events, n=9:
+    # 3h58m-5h04m, mean 4h31m, sd 18.2 min. Duration 29-72 min, mean 45.3.
+    #
+    #     weekday `0 4`  ready(max) 10:16  ready(3sd) 10:42  margin +104 / +76
+    #     weekday `0 5`  ready(max) 11:16  ready(3sd) 11:42  margin  +44 / +16  FAIL
+    #     weekend `0 0`  ready(max) 06:16  ready(3sd) 06:42  margin +239 / +212
+    #
+    # So `0 4` IS THE LATEST WEEKDAY CRON THAT CLEARS 60 MINUTES. It moves the
+    # weekday start from ~04:31 to ~08:31 — four hours, far more than the 1h30
+    # requested — and leaves the weekend, which carries the bigger card and the
+    # earlier deadline, untouched.
+    # ══════════════════════════════════════════════════════════════════════
+    # MOVED 2026-10-22. weekend `0 0` -> `30 0`, weekday `0 0` -> `0 1`.
+    #
+    # WHY, AND IT IS NOT "LATER IS BETTER". Niki asked for a ~11:00 Sofia
+    # start. The early start he is complaining about IS the bimodality of the
+    # scheduler delay: the cron was sized for a SLOW cluster and a FAST one
+    # has been running since 2026-10-19.
+    #
+    #   weekday lag, `measured` 2026-10-22, ONE unchanged cron throughout:
+    #     SLOW  n=6  mean 276.3  sd 18.8  max 304.9  mean+3sd 332.6
+    #     fast  n=4  mean 135.6  sd  6.9  max 144.1  mean+3sd 156.2
+    #   weekend lag, n=6, mean 253.2, sd 29.7, max 293.7, mean+3sd 342.3
+    #     -- NOT split: its largest-gap/median-gap ratio is 2.61 against the
+    #        weekday's 17.33, so the whole series governs.
+    #
+    # THE SLOW CLUSTER GOVERNS, because nothing explains the gap and nothing
+    # licenses assuming the fast one persists.
+    #
+    # THE CRON IS THE LATEST THAT CLEARS THE REGISTERED 60 MINUTES ON BOTH
+    # PAIRINGS the margin takes the worse of, at the localised floor:
+    #
+    #   weekday  floor 09:30 UTC (summer)
+    #     cap from (slow max 304.9, picks  88.1) = 117.0
+    #     cap from (slow 3sd  332.6, picks 107.0) =  70.4  <- binds
+    #     -> floor15 -> `0 1`  = 01:00 UTC
+    #   weekend  floor 09:00 UTC (summer)
+    #     cap from (max 293.7, picks  88.1) =  98.2
+    #     cap from (3sd 342.3, picks 107.0) =  30.7  <- binds
+    #     -> floor15 -> `30 0` = 00:30 UTC
+    #
+    # A DEVIATION FROM THE BRIEF, STATED. The brief derived the cron from the
+    # PARALLEL picks bound (55.1, `simulated` n=72; the MEASURED parallel
+    # series is n=1 at 35.1). That gives `0 2` / `15 1` and a 10:33 Sofia
+    # slow-case start -- but it leaves the margin at **+10.4** under the picks
+    # constants this project still retains (107.0), i.e. a breach by its own
+    # instrument, and those constants are retained precisely because the
+    # parallel bound is n=1. Rule 4 says the pessimistic reading governs a
+    # safety choice, so the pessimistic PICKS term governs too. `0 2` is
+    # recorded as what the fast-cluster/parallel-bound world allows and is
+    # gated on 2026-11-04.
+    #
+    # SUMMER BINDS. One UTC cron serves both seasons and the localised floor
+    # is an hour earlier in summer, so summer sets the cron and winter
+    # inherits an extra hour.
+    #
+    # THE RESULTING MARGIN, both pairings, both seasons:
+    #   summer  weekday +117.0 / +70.4 -> binding +70.4
+    #           weekend +128.2 / +60.7 -> binding +60.7
+    #   winter  weekday +177.0 / +130.4            +130.4
+    #           weekend +188.2 / +120.7            +120.7
+    #
+    # AND THIS IS A TRADE, NOT A REPAIR. Corrected while writing the tests:
+    # the old weekday margin read +20.7, but that is the POOLED figure, and
+    # the pooled mean+3sd of a bimodal series measures between-cluster
+    # distance. UNDER THE SLOW CLUSTER the old cron had **+130.4** -- it
+    # cleared the registered 60 with seventy minutes to spare. So the move
+    # SPENDS 60 minutes of real margin to buy an hour of start time. That is
+    # a legitimate choice and it is Niki's; it is written down as a trade
+    # because a change sold as a fix does not get re-examined.
+    #
+    # WHAT THIS CRON ACTUALLY PRODUCES (Sofia), old -> new:
+    #   weekday  SLOW mean+3sd  08:33 -> 09:33 summer / 08:33 winter
+    #            SLOW mean      07:36 -> 08:36 / 07:36
+    #            fast mean      05:16 -> 06:16 / 05:16
+    #   weekend  mean+3sd       08:42 -> 09:12 summer / 08:12 winter
+    #            mean           07:13 -> 07:43 / 06:43
+    #
+    # SO THE ANSWER TO "11:00" IS +1h on the weekday and +30m on the weekend,
+    # not four hours. A single UTC cron cannot deliver a fixed local start
+    # while the delay is bimodal, and averaging the clusters would describe
+    # neither. 11:00 needs the fast cluster to BE a regime -- registered for
+    # 2026-11-04 with its falsifiable condition in the ledger entry.
+    #
+    # THE LAG SERIES RESETS TO n=0. Membership keys on the run's own headSha
+    # carrying the cron in force, so the margin reports NOT COMPUTED until
+    # runs fire under these crons. That is the honest state and it does not
+    # alarm; the conservative reading until then is the slow cluster above.
+    # ══════════════════════════════════════════════════════════════════════
+    - cron: '30 0 * * 6,0'  # Sat/Sun 00:30 UTC = 03:30 Sofia summer, 02:30 winter
+    # REVERTED TO 00:00 on 2026-10-18. MEASURED over the weekday series'
+    # own n=5 under `0 4`: delays 283/288/316/443/458 min, mean 357.5,
+    # sd 85.6, max 458 (7h38m). Against the 12:00 weekday deadline that
+    # is margin max -66m and mean+3sd -241m - picks land roughly four
+    # hours past the deadline on a 3sd weekday.
+    #
+    # At `0 0` the same distribution gives margin max +174m and
+    # mean+3sd -1m. SO THIS DOES NOT FULLY RESTORE THE MARGIN: it buys
+    # exactly the 240 minutes the shift is worth, and the weekday
+    # SPREAD (sd 85.6 against the weekend's 29.7) still puts 3sd a
+    # hair under zero. It is a large improvement and not a fix, and it
+    # is taken because -1m beats -241m on every criterion.
+    #
+    # THIS DOES NOT DECIDE THE HOUR HYPOTHESIS. If the hour matters the
+    # gain is larger (the weekend `0 0` series has a third the spread);
+    # if it does not, the figures above hold. The registered trial in
+    # docs/scheduler-hour-hypothesis.md settles it, not this change.
+    #
+    # TWO ENTRIES, NOT ONE `0 0 * * *`: the day types keep different
+    # DEADLINES (10:15 weekend, 12:00 weekday), the audit's two-cron
+    # attribution stays exercised, and either day type can be moved
+    # again without touching the other. The two series are separate
+    # populations because they are keyed by DAY TYPE, not by cron.
+    - cron: '0 1 * * 1-5'   # Mon-Fri 01:00 UTC = 04:00 Sofia summer, 03:00 winter
+  workflow_dispatch: # Allow manual trigger
+
+# Serialize runs so a manual dispatch can never write to the DB at the same
+# time as the scheduled run — the second queues until the first finishes.
+concurrency:
+  group: daily-picks
+  cancel-in-progress: false
+
+jobs:
+  daily-picks:
+    runs-on: ubuntu-latest
+    # Worst case: 65+15+50+150+60+15 = 355 min. Keep this at or above that sum —
+    # GitHub CANCELS the job at the cap rather than failing a step, which loses
+    # the whole day silently rather than tripping the failure alert.
+    #
+    # The national-team (World Cup) history backfill used to run here and then
+    # in its own job. Removed 2026-08-07: WC 2026 is over and the next one is
+    # four years out, so the coverage probe and the 90-minute backfill were pure
+    # overhead on every run. `--backfill-wc` still exists as a CLI command for
+    # when qualifiers resume — see docs/production-review-100x.md.
+    timeout-minutes: 360
+
+    env:
+      API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+      FOOTBALL_DATA_ORG_KEY: ${{ secrets.FOOTBALL_DATA_ORG_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Claude Pro subscription auth for briefings (claude_code backend, $0 extra).
+      # Generate locally with `claude setup-token`.
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      # Use the secret when configured; otherwise fall back to the explicit
+      # dev opt-in so existing CI runs don't break before the secret is added.
+      MODEL_HMAC_KEY: ${{ secrets.MODEL_HMAC_KEY }}
+      BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # data/models/ also carries match_history.parquet + its metadata — the
+      # local mirror of completed-match history. Restoring it here means the
+      # seven CLI steps below share one copy AND it survives to tomorrow's run,
+      # so each step syncs only the rows whose updated_at moved instead of
+      # re-reading the whole history from Supabase. Losing the cache is safe:
+      # the first sync just rebuilds the file from scratch.
+      - name: Restore ML models + history mirror cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            data/models/
+            data/historical_load_cache.json
+          key: betting-models-${{ github.run_number }}
+          restore-keys: |
+            betting-models-
+
+      - name: Restore camoufox binary cache
+        id: restore-camoufox
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            camoufox-${{ runner.os }}-
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        env:
+          NODE_NO_WARNINGS: 1
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Chrome (stable) and Xvfb
+        run: |
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb xvfb
+          google-chrome --version
+
+      - name: Start virtual display (Xvfb)
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -ac 2>/dev/null &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 1
+          echo "Virtual display started on :99"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt
+          # Remove GPU libraries pulled as XGBoost transitive deps on CPU-only runner
+          pip uninstall -y nvidia-nccl-cu12 2>/dev/null || true
+          python -c "import nltk; nltk.download('vader_lexicon', quiet=True)"
+
+      - name: Download camoufox Firefox binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m camoufox fetch
+        continue-on-error: true
+
+      - name: Create directories
+        run: mkdir -p data/models logs
+
+      - name: Create config from example
+        run: cp config/config.example.yaml config/config.yaml
+
+      - name: Verify database connection
+        run: |
+          python -c "
+          from src.data.database import init_db
+          db = init_db()
+          assert db.health_check(), 'Database health check failed'
+          print('Database connection OK' if db.is_postgres else 'Database connection OK (SQLite fallback)')
+          "
+
+      - name: Mark DB tables as created
+        run: echo "TABLES_CREATED=1" >> $GITHUB_ENV
+
+      # Stage 12.1, Defect 2: NO continue-on-error here, deliberately.
+      # Every other core step keeps it so one scraper hiccup cannot half-abort
+      # the pipeline. Tests are different: they gate whether this code is fit to
+      # generate picks at all. A failing suite used to leave the job green AND
+      # the alert undelivered — a silently broken run. Failing here stops the
+      # job before update/settle/picks, which is the correct blast radius: a
+      # missed day of picks is recoverable, picks generated from code whose
+      # tests fail are not obviously wrong and may never be noticed.
+      # BOUNDED 2026-10-01. Until today this step had NO timeout-minutes, so it
+      # inherited the 360-minute JOB cap — and a job cancelled at the cap loses
+      # the day with no alert, because `always()` steps are not guaranteed a
+      # grace period once the job is cancelled. A step-level timeout is a
+      # different event: GitHub marks the STEP `failure`, the job halts here (no
+      # continue-on-error, deliberately), every step below reports `skipped`, and
+      # the critical-step alert — which runs `if: always()` and keys on those
+      # downstream outcomes rather than on anything tests-specific — fires with
+      # "step(s) DID NOT RUN". That path is not hypothetical: it is exactly what
+      # ran on 2026-10-01 when a test FAILED, and a timeout produces the same
+      # downstream state.
+      #
+      # 15 MINUTES = ~7x the measured maximum. The suite runs in 119-130s in CI
+      # (n=4, measured 2026-09-28..10-01), so 15 min absorbs the 2-3x variance an
+      # unlucky runner produces while cutting an unbounded hang from 360 min to
+      # 15. Raise it when the measured baseline moves, not when it trips.
+      - name: Run tests
+        id: tests
+        timeout-minutes: 15
+        # `not live` ADDED 2026-10-18, at a cost of SIX CARDS. A test that
+        # queries live external state changes its verdict with no code change,
+        # which is the property `calendar` was created for on 2026-10-09 —
+        # and a `live` test was added straight back into this gate four days
+        # later. Membership is DECLARED by the marker, never inferred.
+        # ── GATING IS OPT-IN FROM 2026-10-28. FOUR CARDS BOUGHT THIS. ────
+        #
+        # WAS `-m "not calendar and not live"`, which gated EVERY test and
+        # excluded two markers by hand. So each new test gated price capture
+        # by DEFAULT and had to be opted out, and that default has been wrong
+        # four times -- 10-09 (1 card), 10-13 (6), 10-21 (1), 10-27 (1).
+        # THREE OF THE FOUR were clock-dependent tests that say nothing about
+        # whether capture writes correct rows.
+        #
+        # `capture_critical` is applied AUTOMATICALLY from the import graph by
+        # `tests/conftest.py`, never by hand: a test is capture-critical if it
+        # imports a module on the path that WRITES a captured row. The
+        # criterion lives in `scripts/capture_critical.py`; the controls in
+        # `tests/test_gate_is_opt_in.py`.
+        #
+        # MEASURED 2026-10-28: 2,547 tests gated; 1,641 gate now; 916 moved
+        # to `non-gating-tests.yml`, where a failure reddens that workflow and
+        # cannot stop `--update`, `--settle` or `--picks`.
+        #
+        # `not calendar and not live` IS KEPT. Those two are DECLARED
+        # membership and this one is DERIVED, and they do not cover each
+        # other: `test_empty_card_suppression.py` imports a scraper (inside
+        # one test, at line 307) and is therefore capture-critical, while the
+        # test that cost the 10-09 card is `calendar`-marked. Drop the markers
+        # and that card is lost again.
+        run: >-
+          python -m pytest tests/ -v --tb=short
+          -m "capture_critical and not calendar and not live"
+
+      # ── CALENDAR ASSERTIONS, OUT OF THE CAPTURE-GATING PATH (Stage 28) ────
+      #
+      # A test whose pass/fail changes with no code change must not be able to
+      # stop price capture. On 2026-10-09 two of them did: the empty-card
+      # suppression's expiry (firing exactly as designed) and three quota tests
+      # that inherited the H1 allocator's first active day. Between them they
+      # stopped `Run tests`, which stopped `--update`, which lost the first real
+      # card in nineteen days — 26 fixtures, 2416 odds rows — recovered only by
+      # a manual dispatch with 3h01m to spare. The recovery depended on someone
+      # watching.
+      #
+      # THE GATE DECISION IS UNCHANGED. The step above still halts the job, so
+      # capture never runs on an untested tree — wrong odds rows never backfill
+      # and are indistinguishable downstream. Only the CALENDAR assertions move.
+      #
+      # `continue-on-error` here means "does not gate capture", NOT "ignored":
+      # the critical-step alert below reads this step's outcome and reddens the
+      # run. Membership is DECLARED by the `calendar` marker, never inferred —
+      # a grep over `date.today()` in tests/ finds 56 candidates and misses
+      # exactly the three that fired.
+      # ── THE CALENDAR ASSERTIONS LEFT THIS WORKFLOW. 2026-10-21. ─────────
+      #
+      # They ran here with `continue-on-error`, and the critical-step alert
+      # below then exited 1 on their outcome -- so a reminder reaching its
+      # date made this run conclude `failure` while all five critical steps
+      # succeeded. ONE RUN, TWO FACTS. A human reading red could not tell
+      # "the card was lost" from "a decision is due", and that inability is
+      # what cost six cards on 2026-10-13..18.
+      #
+      # They now live in `.github/workflows/reminders.yml`, triggered on this
+      # workflow's `workflow_run: completed` -- by dependency, never by a
+      # clock -- and it runs whether this one succeeded or failed and prints
+      # which. `tests/test_one_meaning_per_run.py` asserts that no reminder
+      # can redden this workflow again.
+      #
+      # THE GATE DECISION IS STILL UNCHANGED: `Run tests` above halts the job,
+      # so capture never runs on an untested tree.
+
+      - name: Run daily update (fixtures + odds, no Flashscore results)
+        id: update
+        run: python -m src.agent.betting_agent --update --skip-ml-retrain
+        timeout-minutes: 65
+        continue-on-error: true
+
+      - name: Settle yesterday's predictions
+        id: settle1
+        run: python -m src.agent.betting_agent --settle
+        timeout-minutes: 15
+        continue-on-error: true
+
+      - name: Retrain ML models (if stale)
+        id: retrain_ml
+        run: python -m src.agent.betting_agent --train
+        timeout-minutes: 50
+        continue-on-error: true
+
+      # ── THE TELEGRAM FAILURE ALERT WAS REMOVED HERE. 2026-10-22. ──────────
+      #
+      # It said "⚠️ ML training step killed by CI timeout — model not updated.
+      # Raise timeout-minutes or reduce sample target." It is the hardest of
+      # the removals to argue, because it ends in an instruction — and an
+      # instruction is the class that STAYS. It goes anyway: the instruction is
+      # standing advice attached to a step's outcome, not a response to
+      # anything the run measured. Nothing in the message is a number.
+      #
+      # WHAT CARRIES IT NOW, and the last line is the uncomfortable one:
+      #   * NOT GitHub's notification. The retrain step above is
+      #     `continue-on-error: true`, so a retrain failure does not redden
+      #     this run and no notification is sent for it.
+      #   * The SELF-CORRECTION does carry the single-day case:
+      #     `_ml_models_stale(max_age_days=models.ml_retrain_days, default 3)`
+      #     is asked at the top of every `daily_update()`, so the next run
+      #     retrains. One failed retrain repairs itself.
+      #   * A PERSISTENTLY failing retrain was carried by NOTHING. Staleness
+      #     was `logger.info`-only and no workflow, report or audit surface
+      #     alarmed on the models' age. THAT GAP IS NOW CLOSED by the step
+      #     below, which checks the OUTCOME instead of the step: whether an
+      #     artefact exists, what timestamp it carries, and which run wrote
+      #     it. A step that exits zero while writing nothing is the shape the
+      #     removed alert could never have caught.
+      #
+      # MEASURED over 2026-09-22..10-22: `skipped` in 36 of 36 runs. This
+      # sender had never once fired, so no observation is being lost today.
+      #
+      # The condition it carried is kept here because it was itself a fix: it
+      # was `!= 'success'` until 2026-09-20, which delivered "killed by CI
+      # timeout" for a step that had been SKIPPED and never started.
+
+      - name: Check the MODEL, not the retrain step
+        # `always()` and NO condition on `steps.retrain_ml`, deliberately.
+        # Keying this on the retrain step's outcome would rebuild the thing it
+        # replaces: the question is how old the newest model IS, which has an
+        # answer whether or not a retrain was attempted today.
+        if: always()
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          # EXIT 1 IS A FINDING AND IT DOES NOT REDDEN THE RUN
+          # (`continue-on-error`), because DEL-2 reserves this workflow's red
+          # for "the day produced no picks". A stale model still produced
+          # picks -- from Poisson + Elo -- so it is CONTENT, carried to
+          # Telegram by the script itself, not a colour.
+          python -m scripts.model_freshness
+
+      - name: Check DB health
+        run: |
+          python << 'PYEOF'
+          from src.data.database import get_db
+          from src.data.models import Match, SavedPick
+          db = get_db()
+          with db.get_session() as session:
+              completed = session.query(Match).filter(Match.home_goals.isnot(None)).count()
+              fixtures = session.query(Match).filter(Match.is_fixture == True).count()
+              picks = session.query(SavedPick).count()
+              pending = session.query(SavedPick).filter(SavedPick.result.is_(None)).count()
+          print(f'DB health: {completed} completed matches | {fixtures} fixtures | {picks} total picks ({pending} pending)')
+          if completed < 100:
+              print('WARNING: fewer than 100 completed matches — ML training may be skipped')
+          PYEOF
+
+      # Restore BEFORE picks: get_daily_picks reads the final:<match_id> freeze
+      # markers from this file — restoring after picks let a second run
+      # regenerate picks behind briefing decisions (only dedup caught it).
+      - name: Restore briefings-sent guard
+        uses: actions/cache/restore@v5
+        with:
+          path: data/briefings_sent.json
+          key: briefings-sent-${{ github.run_id }}
+          restore-keys: |
+            briefings-sent-
+
+      # Claude Code CLI must be installed BEFORE picks: the --picks step now runs
+      # Claude's per-match review (KEEP/CHANGE) on every pick before sending the
+      # summary. No separate briefing step — briefing articles are not posted.
+      - name: Install Claude Code CLI (pick review via Pro subscription)
+        run: npm install -g @anthropic-ai/claude-code
+        continue-on-error: true
+
+      # Scaling this step: analysis is per-fixture and parallelises, but the
+      # phase after it (ranking, per-match cap, correlation filter, and the
+      # daily `betting.max_total_kelly_pct` exposure cap) is a property of the
+      # whole day's slate — four shards each applying a 40% cap would stake
+      # 160%. So the split is analyse-then-collect, not run-the-pipeline-N-times:
+      #
+      #   matrix job i of N:
+      #     python -m src.agent.betting_agent --picks --force       #       --shard i/N --out data/candidates/candidates-00i.json
+      #     (upload data/candidates/ as an artifact)
+      #
+      #   collect job (needs: all shards, downloads the artifacts):
+      #     python -m src.agent.betting_agent --picks --collect data/candidates
+      #
+      # `--shard 1/1` is a no-op and behaves exactly like the line below, so a
+      # matrix of size 1 needs no collect job. Left single-process here
+      # deliberately: at current volume a matrix costs more in runner setup than
+      # it saves. See docs/production-review-100x.md (S1-1).
+      - name: Generate, review, and send picks
+        id: picks
+        run: python -m src.agent.betting_agent --picks --force
+        timeout-minutes: 150
+        continue-on-error: true
+
+      - name: Save briefings-sent guard
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/briefings_sent.json
+          key: briefings-sent-${{ github.run_id }}
+
+      - name: Scrape Flashscore results for all leagues (post-picks)
+        id: results
+        if: always()
+        run: python -m src.agent.betting_agent --update-results
+        timeout-minutes: 60
+        continue-on-error: true
+
+      - name: Settle late results (post update-results)
+        id: settle2
+        if: always()
+        run: python -m src.agent.betting_agent --settle
+        timeout-minutes: 15
+        continue-on-error: true
+
+      # Loud failure alert: every core step above runs with continue-on-error so
+      # the pipeline never half-aborts, but that also keeps the JOB green on a
+      # crash — a silent no-pick / no-briefing day. This step inspects each step's
+      # outcome and sends ONE Telegram alert if any critical step failed, so a
+      # real crash is never invisible.
+      #
+      # `outcome` IS THREE-VALUED AND WAS READ AS TWO-VALUED (2026-09-20).
+      # On run 35498465743 `Run tests` — the one core step with no
+      # continue-on-error — failed, so the job halted and every unguarded step
+      # below it was SKIPPED. This script tested only `== "failure"`, found
+      # none, and printed `All critical steps OK` with picks='skipped'. The step
+      # whose entire purpose is to catch "the day produced nothing" reported the
+      # day as healthy, and DEL-2 never reached its branch because its predicate
+      # names `failure` and the picks step had never run.
+      #
+      # FAILED and DID NOT RUN are different events with the same consequence,
+      # so they are counted apart and alerted together. Anything that is none of
+      # success/failure/skipped (`cancelled` at the timeout cap) is reported as
+      # itself rather than folded into either.
+      # ── THE LOSS, NOT THE MECHANISM'S STATE (added 2026-10-18) ──────────
+      #
+      # MEASURED: this workflow failed on six consecutive days and sent six
+      # messages reading "Daily picks workflow FAILED (run #NNN)". Every one
+      # fired correctly and produced no action. They carried no card size (137
+      # fixtures were in those cards), no statement that a price does not
+      # backfill, no deadline, and no cumulative total - the sixth looked
+      # exactly like the first.
+      #
+      #     A repeated identical alarm is background.
+      #
+      # This step measures the streak as CONSECUTIVE DAYS WITH A CARD AND ZERO
+      # PICKS - the loss itself - and escalates its wording at N=2 and N=3. It
+      # needs DATABASE_URL, which is why it is a step and not a shell line.
+      - name: Report the LOSS when no picks were produced
+        id: loss
+        if: always() && steps.picks.outcome != 'success'
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOSS_ALERT_BODY: ${{ runner.temp }}/loss_alert.txt
+          LOSS_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python -m scripts.pipeline_loss_alert
+          if [ -s "${{ runner.temp }}/loss_alert.txt" ]; then
+            python -m scripts.ci_alert "$(cat "${{ runner.temp }}/loss_alert.txt")"
+          fi
+
+      # RENAMED from "Alert on critical step failure" 2026-10-22: it no longer
+      # alerts. It decides the run's COLOUR and prints the step states.
+      - name: Decide the run colour from the critical steps
+        if: always()
+        env:
+          # The two TELEGRAM secrets were removed from this step with the send.
+          # A credential handed to a step that cannot use it is the shape that
+          # made an alert look configured for three weeks while delivering
+          # nothing (Stage 12.1, Defect 2) -- in the other direction, but the
+          # same mismatch between what a step is given and what it does.
+          O_UPDATE: ${{ steps.update.outcome }}
+          O_SETTLE1: ${{ steps.settle1.outcome }}
+          O_PICKS: ${{ steps.picks.outcome }}
+          O_RESULTS: ${{ steps.results.outcome }}
+          O_SETTLE2: ${{ steps.settle2.outcome }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'EOF'
+          # `subprocess` went with the Telegram send below: it was imported
+          # for `ci_alert` and nothing else here used it.
+          import os, sys
+          # `tests` is no longer listed: it has no continue-on-error, so a
+          # failure there fails the job outright and this step reports it
+          # through the job status rather than as a "stayed green" warning.
+          steps = {
+              "update": os.environ.get("O_UPDATE", ""),
+              "settle (pre-picks)": os.environ.get("O_SETTLE1", ""),
+              "picks (incl. review)": os.environ.get("O_PICKS", ""),
+              "update-results": os.environ.get("O_RESULTS", ""),
+              "settle (post-results)": os.environ.get("O_SETTLE2", ""),
+          }
+          # THREE STATES, KEPT APART. `skipped` means an earlier unguarded step
+          # failed and this one never executed — not that it succeeded.
+          failed = [n for n, o in steps.items() if o == "failure"]
+          not_run = [n for n, o in steps.items() if o == "skipped"]
+          odd = [f"{n}={o!r}" for n, o in steps.items()
+                 if o not in ("success", "failure", "skipped")]
+          # ── ONE MEANING PER RUN. 2026-10-21. ───────────────────────────
+          # The calendar branch that used to live here read
+          # `steps.calendar.outcome` and `sys.exit(1)` on it, so a reminder
+          # reaching its date reddened a run whose capture had SUCCEEDED.
+          # Stage 28 moved those tests out of the gating path; this moves them
+          # out of the CONCLUSION. They are now their own workflow, and this
+          # alert speaks only about capture.
+          if not (failed or not_run or odd):
+              print("All critical steps OK:", steps)
+              sys.exit(0)
+          # ── THE EM DASHES ARE LOAD-BEARING. DO NOT "TIDY" THEM. ──────────
+          #
+          # `ci_audit.extract()` reads this log with
+          #     r"step\(s\) FAILED — ([A-Za-z][^\n]{0,120})"
+          # and the same for DID NOT RUN. Replacing `—` with `-` while
+          # removing the Telegram send silently emptied `steps_failed` and
+          # `steps_not_run` -- two detectors gone, with no test failing,
+          # because the regexes would simply have stopped matching. The audit
+          # now accepts either dash as well, but these stay as they are.
+          parts = []
+          if failed:
+              parts.append("step(s) FAILED — " + ", ".join(failed))
+          if not_run:
+              parts.append("step(s) DID NOT RUN — " + ", ".join(not_run))
+          if odd:
+              parts.append("step(s) in an UNEXPECTED state — " + ", ".join(odd))
+          # ── THE TELEGRAM SEND WAS REMOVED HERE. 2026-10-22. ───────────────
+          #
+          # It sent "⚠️ Daily picks: step(s) FAILED — update, picks". A list of
+          # step names and their outcomes is run status in its purest form:
+          # every word of it is already on the run's own page.
+          #
+          # THE STEP ITSELF STAYS, and so does everything below this line. It
+          # is what decides the run's COLOUR (DEL-2: red iff pick generation
+          # produced nothing), and the colour is now the carrier -- so deleting
+          # the step would have deleted the thing that replaces the message.
+          #
+          # WHAT CARRIES IT NOW: this `::group::`-less log line, which is kept
+          # verbatim so the log still says which steps; the run's red, hence
+          # GitHub's notification; `ci-audit`, which reads these same step
+          # outcomes out of the log and scores the run; and for the one
+          # consequence a reader can act on -- a card with no picks -- the LOSS
+          # report above, which carries the card size and the deadline.
+          #
+          # MEASURED over 2026-09-22..10-22: a non-success critical step in 9
+          # of 36 runs (0.30/day), against 1 firing of the loss alert.
+          # THE URL ON ITS OWN LINE. `ci_audit`'s pattern captures to the end
+          # of the line, so the old `… — update. Logs: <url>` made the
+          # captured "step name" the step name PLUS the URL -- visible in the
+          # audit's own table for as long as that message existed. Splitting
+          # the line makes the capture exact; it costs nothing and the
+          # historical shape is still readable by the same regex.
+          print("daily picks step states: " + "; ".join(parts))
+          print("Logs: " + os.environ.get("RUN_URL", ""))
+
+          # DEL-2 (Stage 14). Narrow by decision: the job goes RED only when
+          # pick generation failed.
+          #
+          # continue-on-error stays on every step, deliberately. Removing it
+          # would halt the job at the failure, so --update-results, the second
+          # --settle and the cache saves would never run. This changes the run's
+          # COLOUR, not its execution.
+          #
+          # Why only this step: continue-on-error on a scraper absorbs a
+          # routine, recoverable failure — Flashscore times out, results arrive
+          # tomorrow. On pick generation it converts "the day produced nothing"
+          # into a green run. Those were never the same policy; they had the
+          # same setting because nobody had separated them.
+          #
+          # Safe to exit non-zero here: every subsequent step carries
+          # `if: always()` (verified, not assumed — including `Save ML models
+          # cache`), so a red run still saves its artifacts.
+          #
+          # THE PREDICATE IS "PRODUCED NO PICKS", NOT "FAILED". A skipped picks
+          # step is the same day for the reader — nothing was generated — and
+          # it is the state that actually occurred on 2026-09-20 while this
+          # script reported the run healthy.
+          picks = steps["picks (incl. review)"]
+          if picks in ("failure", "skipped"):
+              why = ("FAILED" if picks == "failure" else
+                     "DID NOT RUN (an earlier unguarded step failed)")
+              print(f"::error::Pick generation {why} — no picks were produced "
+                    "for today. Failing the job so the run shows red.")
+              sys.exit(1)
+          EOF
+
+      - name: Send weekly performance report (Sundays only)
+        if: always()
+        run: |
+          if [ "$(date +%w)" = "0" ]; then
+            echo "Sunday — sending weekly performance report"
+            python -m src.agent.betting_agent --report --no-settle
+          else
+            echo "Not Sunday (day=$(date +%w)) — skipping weekly report"
+          fi
+        continue-on-error: true
+
+      - name: Save ML models cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            data/models/
+            data/historical_load_cache.json
+          key: betting-models-${{ github.run_number }}
+
+      - name: Save camoufox binary cache
+        if: always() && steps.restore-camoufox.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cache/camoufox
+          key: camoufox-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
+
+      # ── THE TELEGRAM FAILURE ALERT WAS REMOVED HERE. 2026-10-22. ──────────
+      #
+      # It said "❌ Daily picks workflow FAILED (run #NNN). Logs: …" and that
+      # is the whole message: a conclusion, a number and a link. It is the
+      # exact text `pipeline_loss_alert.py` was written to replace -- see its
+      # module docstring, which quotes it -- and the two then ran side by side
+      # for nine days, so a lost card sent BOTH a status line and a loss
+      # report. The status line arrived first and was the one that trained the
+      # reader.
+      #
+      # WHAT CARRIES IT NOW:
+      #   * the LOSS, which is the part that matters: the "Report the LOSS"
+      #     step above, which fires on `picks.outcome != success`, counts the
+      #     card, states that a price does not backfill, gives the deadline,
+      #     and escalates at N=2 and N=3.
+      #   * the run's red itself: GitHub's own notification.
+      #   * `ci-audit`, which classifies this workflow's red per workflow.
+      #
+      # MEASURED over 2026-09-22..10-22: it fired 11 times in 36 runs
+      # (0.37/day), against 1 firing of the loss alert. Eleven status messages
+      # bought one report of an actual loss.

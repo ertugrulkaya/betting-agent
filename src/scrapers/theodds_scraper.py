@@ -1,0 +1,1829 @@
+"""The Odds API scraper — free-tier supplemental odds source.
+
+Fetches 1X2 and Over/Under odds for leagues that have today's fixtures
+in the DB, using https://api.the-odds-api.com/v4.
+
+Free tier: 500 credits/month (1 credit per league request).
+"""
+
+import asyncio
+import json
+import os
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
+import aiohttp
+
+from src.data.sql_helpers import id_in
+from src.data.database import get_db
+from src.data.models import Match, Odds, SavedPick, Team
+from src.utils.logger import get_logger, utcnow
+from src.data.price_history import record_price as _record_price
+from src.scrapers.barren_leagues import (
+    BARREN_CONSECUTIVE_THRESHOLD, BARREN_TTL_DAYS, BarrenLeagueCache)
+
+logger = get_logger()
+
+_CREDITS_STATE_PATH = Path("data/models/theodds_credits.json")
+_CREDITS_LOW_THRESHOLD = 100   # existing WARNING in betting_agent.py
+
+# Tiered in-scraper warnings (absolute credit counts, out of 500/month free tier)
+_CREDITS_TIER_INFO = 60       # ~3 days of daily runs remaining
+_CREDITS_TIER_WARNING = 40    # ~2 days remaining
+_CREDITS_TIER_CRITICAL = 20   # ~1 day remaining
+_CREDITS_GATE_THRESHOLD = 10  # hard skip — not enough for even one league call
+
+#: How old a credit reading may be and still describe NOW.
+#:
+#: The period check below asks "is this reading from a month that has ended".
+#: That is necessary and it is not sufficient, because a figure can be from THIS
+#: month and still describe a state that is over. On 2026-09-16 the file read
+#: `{"remaining": 154, "updated": "2026-09-10"}` while the provider reported 100
+#: remaining and the durable ledger reported 0 spendable: same period, six days
+#: stale, and wrong in the direction of SPENDING.
+#:
+#: The file is written only when a run actually spends. A gate that refuses
+#: every request therefore FREEZES the last figure, so the staler the file is,
+#: the more likely it is that something stopped the pipeline from updating it —
+#: staleness correlates with exactly the condition it must not fail open on.
+#:
+#: One day, because `_persist_credits` runs on every spending run and the
+#: pipeline runs daily. A reading older than that is NO READING, and the answer
+#: to no reading is to probe — `/v4/sports` is free.
+_CREDITS_MAX_AGE_DAYS = 1
+
+
+def _credits_period(d) -> str:
+    """The billing period a reading belongs to. TheOddsAPI resets monthly."""
+    return str(d)[:7]
+
+
+def _load_persisted_credits() -> Optional[int]:
+    """Last-known remaining credits — but ONLY if the reading is from THIS month.
+
+    A figure written in a previous billing period is NOT a low reading. It is
+    NO reading, and the two must not be confused, because the quota resets to
+    the full tier at the period boundary and the stale number describes a month
+    that is over.
+
+    THIS WAS A NEAR-MISS AND IS NOW NEAR-CERTAIN. Until 2026-09-11 this read
+    `remaining` and ignored `updated`, though `_persist_credits` has always
+    written both. August closed at **15** remaining and cleared the <=10 skip by
+    five credits. **September is projected to exhaust around 09-14**, so the file
+    will carry a figure at or near zero into 1 October — and the first run of the
+    new month would have skipped the odds fetch entirely on a number describing
+    a finished month, with a full 500-credit tier sitting unused.
+
+    Returning None hands the caller "no reading", and the caller's answer to no
+    reading is to PROBE, not to skip. `/v4/sports` is free.
+    """
+    try:
+        if not _CREDITS_STATE_PATH.exists():
+            return None
+        blob = json.loads(_CREDITS_STATE_PATH.read_text())
+        remaining = blob.get("remaining")
+        if remaining is None:
+            return None
+        updated = blob.get("updated")
+        if not updated:
+            # Written before `updated` existed. Undatable is unusable for the
+            # same reason stale is: it cannot be placed in a period.
+            logger.warning(
+                "TheOddsAPI: persisted credit state carries no `updated` date "
+                "— treating as NO READING rather than a low one")
+            return None
+        if _credits_period(updated) != _credits_period(date.today()):
+            logger.warning(
+                f"TheOddsAPI: persisted credit state is from "
+                f"{_credits_period(updated)} and today is "
+                f"{_credits_period(date.today())} — the quota has reset since. "
+                f"Treating {remaining} as NO READING, not a low one.")
+            return None
+        # SAME PERIOD IS NOT THE SAME AS CURRENT. A reading can be from this
+        # month and still describe a state that ended days ago, and a stale
+        # figure that is too HIGH is a permission to spend that does not exist.
+        # This is the period check one layer down: not "has the quota reset"
+        # but "does this number still describe now".
+        try:
+            age = (date.today() - date.fromisoformat(str(updated))).days
+        except ValueError:
+            logger.warning(
+                f"TheOddsAPI: persisted credit state carries an unparseable "
+                f"`updated` ({updated!r}) — treating as NO READING")
+            return None
+        if age > _CREDITS_MAX_AGE_DAYS:
+            logger.warning(
+                f"TheOddsAPI: persisted credit state is {age} day(s) old "
+                f"(written {updated}, max {_CREDITS_MAX_AGE_DAYS}). "
+                f"Treating {remaining} as NO READING, not a current one — a "
+                f"stale figure that is too high permits spending that is not "
+                f"there. Probing instead.")
+            return None
+        return remaining
+    except Exception:
+        pass
+    return None
+
+
+def _persist_credits(remaining: int) -> None:
+    """Save current remaining credit count so next run can warn early."""
+    try:
+        _CREDITS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CREDITS_STATE_PATH.write_text(
+            json.dumps({"remaining": remaining, "updated": date.today().isoformat()})
+        )
+    except Exception:
+        pass
+
+#: The picks cron, and how long after it a run can still be PENDING.
+#:
+#: 03:00 UTC (Stage 21 moved it from 09:37), plus the observed maximum scheduler
+#: delay of 11h21m (regime `37 9 * * *`, n=39, retired), plus the p90 run duration of 106 minutes. Outside this
+#: window a picks run cannot still be pending, so the guard below must not
+#: decline — that is precisely what the REVERTED version got wrong: it asked
+#: "have today's picks run" via a `date.today()` marker, which stayed false at
+#: 23:17 and 01:00 and declined every overnight slot. Captures stopped for a
+#: full day and H5's sample rate fell to zero.
+#: ── RE-POINTED 2026-10-22, AND IT WAS ALREADY STALE BEFORE THAT. ─────────
+#:
+#: This read `3 * 60` while `daily-picks.yml` had carried `0 0` since
+#: 2026-10-18 — so the window opened at 03:00 while runs were starting from
+#: 02:08 (the fast lag cluster, measured 2026-10-19..22). Inside the window
+#: the guard RESERVES credits for a pending picks run; outside it does not.
+#: A window that opens too LATE therefore leaves the picks run unprotected
+#: for the first part of its own schedule, which is the unsafe direction.
+#:
+#: It is now the EARLIEST cron of the two, because one window serves both day
+#: types: weekend `30 0` = 00:30 UTC, weekday `0 1` = 01:00 UTC.
+#:
+#: THE 13-HOUR WIDTH IS KEPT AND IS NOW GENEROUS RATHER THAN TIGHT. The
+#: latest a run can still be pending is cron + max observed delay + p90 run
+#: duration = 60 + 342.3 + 106 = 508 min (08:28 UTC), well inside 13:30. The
+#: width is left alone because narrowing it is the unsafe direction and buys
+#: nothing.
+#:
+#: ── AND THE MOVE IMPROVES THE GUARD, WHICH IS THE OPPOSITE OF THE WORRY. ──
+#:
+#: Over-declining once took captures to zero for a day, so widening the
+#: window at the early edge looked like a cost. `measured` 2026-10-22 against
+#: the eight real `closing-lines` slots (`47 10` and `17 11,13,15,17,19,21,23`):
+#:
+#:   slot    in OLD [03:00,16:00]   in NEW [00:30,13:30]
+#:   10:47   yes                    yes
+#:   11:17   yes                    yes
+#:   13:17   yes                    yes
+#:   15:17   yes                    NO   <- now ALWAYS PROCEEDS
+#:   17:17 .. 23:17   no            no
+#:
+#:   slots that can decline: 4/8 -> 3/8
+#:   captures newly EXPOSED per week:   0
+#:   captures newly PROTECTED per week: 7
+#:
+#: THE EARLY EDGE GAINS NOTHING BECAUSE THE FIRST SLOT IS 10:47 -- there is no
+#: capture between 00:30 and 03:00 to expose. The late edge loses one. And the
+#: three remaining exposed slots decline only on a day that produced no picks:
+#: on every reading picks are done by 08:08-09:01 UTC, before 10:47, and the
+#: guard stands down the moment any pick exists for the day.
+#:
+#: DERIVED, NOT RESTATED. `3 * 60` was stale by three hours because nothing
+#: tied it to the cron. It is still a literal here -- a scraper must not parse
+#: workflow YAML at runtime -- but `test_picks_run_guard` now asserts it
+#: equals the EARLIER of the two `daily-picks` crons, so it cannot diverge
+#: again without a test failing.
+_PICKS_CRON_MINUTE_OF_DAY = 30                    # 00:30 UTC, the earlier cron
+_PICKS_EXPOSURE_WINDOW_MINUTES = 13 * 60          # 00:30 -> 13:30 UTC
+
+
+def _picks_run_may_be_pending(now) -> bool:
+    """Is `now` inside the window in which a picks run could still be running?
+
+    A TIME BOUND, NOT A DATE MARKER. The reverted guard had no bound at all, so
+    "today's picks have not been written" was true from midnight and again all
+    evening. This returns False outside the window whatever the database says.
+    """
+    mod = now.hour * 60 + now.minute
+    return _PICKS_CRON_MINUTE_OF_DAY <= mod <= (
+        _PICKS_CRON_MINUTE_OF_DAY + _PICKS_EXPOSURE_WINDOW_MINUTES)
+
+
+# ---------------------------------------------------------------------------
+# League key → The Odds API sport key mapping
+# Only leagues that The Odds API supports (romania/liga-1 is excluded).
+# ---------------------------------------------------------------------------
+LEAGUE_TO_THEODDS_SPORT: Dict[str, str] = {
+    # Top 5
+    "england/premier-league":          "soccer_epl",
+    "spain/laliga":                    "soccer_spain_la_liga",
+    "germany/bundesliga":              "soccer_germany_bundesliga",
+    "italy/serie-a":                   "soccer_italy_serie_a",
+    "france/ligue-1":                  "soccer_france_ligue_one",
+    # Strong European
+    "netherlands/eredivisie":          "soccer_netherlands_eredivisie",
+    "portugal/primeira-liga":          "soccer_portugal_primeira_liga",
+    "belgium/jupiler-pro-league":      "soccer_belgium_first_div",
+    "turkey/super-lig":                "soccer_turkey_super_league",
+    "scotland/premiership":            "soccer_spl",
+    # European Competitions
+    "europe/champions-league":         "soccer_uefa_champs_league",
+    "europe/europa-league":            "soccer_uefa_europa_league",
+    "europe/europa-conference-league": "soccer_uefa_europa_conference_league",
+    # English lower divisions
+    "england/championship":            "soccer_efl_champ",
+    "england/league-one":              "soccer_england_league1",
+    "england/league-two":              "soccer_england_league2",
+    # Second divisions
+    "spain/laliga2":                   "soccer_spain_segunda_division",
+    "germany/2-bundesliga":            "soccer_germany_bundesliga2",
+    "italy/serie-b":                   "soccer_italy_serie_b",
+    "france/ligue-2":                  "soccer_france_ligue_two",
+    "austria/bundesliga":              "soccer_austria_bundesliga",
+    "switzerland/super-league":        "soccer_switzerland_superleague",
+    "greece/super-league":             "soccer_greece_super_league",
+    "denmark/superliga":               "soccer_denmark_superliga",
+    # Nordic / Eastern
+    "norway/eliteserien":              "soccer_norway_eliteserien",
+    "sweden/allsvenskan":              "soccer_sweden_allsvenskan",
+    "poland/ekstraklasa":              "soccer_poland_ekstraklasa",
+    # romania/liga-1 intentionally omitted — not available on The Odds API
+    # International — national team competitions
+    "world/fifa-world-cup":             "soccer_fifa_world_cup",
+}
+
+# Bookmaker prefix so these odds rows are distinguishable from API-Football rows
+BOOKMAKER_PREFIX = "TheOddsAPI"
+
+BASE_URL = "https://api.the-odds-api.com/v4"
+
+#: Per-league outcomes for a request the provider DECLINED. They are not
+#: "no odds exist" and they are not a transport error, and the difference has
+#: to survive all the way to the log or the run reads as a quiet day.
+REFUSED_EXHAUSTED = "refused_exhausted"
+REFUSED_RATE_LIMITED = "refused_rate_limited"
+
+
+class Refusal:
+    """The provider declined this request. NOT an empty catalogue.
+
+    `[]` means "this league has no priced games"; `None` means "the call
+    failed"; this means "the provider would not serve it, and here is why".
+    Three states that a two-state return type kept collapsing — the same shape
+    as `result=ok` defaulting to success, and the third instance of it inside
+    this one file.
+
+    Deliberately NOT falsy: `not games` must not quietly sort a refusal into
+    the empty bucket. Every consumer has to name it.
+    """
+
+    __slots__ = ("reason", "sport_key")
+
+    def __init__(self, reason: str, sport_key: str = ""):
+        self.reason = reason
+        self.sport_key = sport_key
+
+    @property
+    def exhausted(self) -> bool:
+        return self.reason == REFUSED_EXHAUSTED
+
+    def __repr__(self) -> str:
+        return f"<Refusal {self.reason} {self.sport_key}>"
+
+
+def _outcome_of(games) -> str:
+    """Per-league outcome. FOUR states, because there are four.
+
+    A refusal is checked FIRST and by type, not by truthiness: `Refusal` is not
+    falsy precisely so that a `not games` test cannot sort it into `no_rows`
+    and mark a league the provider never served as one the provider has nothing
+    for. `barren.record()` only accepts `ok`/`no_rows`, so a refusal still
+    cannot poison the barren-league cache — that guard already worked and is
+    preserved by construction rather than by a second check.
+    """
+    if isinstance(games, Refusal):
+        return games.reason
+    if games is None:
+        return "error"
+    return "no_rows" if not games else "ok"
+
+
+def _normalise(name: str) -> str:
+    """Lowercase + strip for fast pre-filter before fuzzy matching."""
+    return name.lower().strip()
+
+
+import unicodedata
+from difflib import SequenceMatcher
+
+_ALIASES: Dict[str, str] = {
+    # England
+    "man city": "manchester city",
+    "man united": "manchester united",
+    "man utd": "manchester united",
+    "spurs": "tottenham hotspur",
+    "tottenham": "tottenham hotspur",
+    "wolves": "wolverhampton wanderers",
+    "wolverhampton": "wolverhampton wanderers",
+    "newcastle": "newcastle united",
+    "west ham": "west ham united",
+    "leicester": "leicester city",
+    "brighton": "brighton & hove albion",
+    "brighton hove albion": "brighton & hove albion",
+    "sheffield utd": "sheffield united",
+    "nottingham": "nottingham forest",
+    "nott'm forest": "nottingham forest",
+    "nott'm f": "nottingham forest",
+    # Spain
+    "ath bilbao": "athletic bilbao",
+    "ath madrid": "atletico madrid",
+    "atl. madrid": "atletico madrid",
+    "atl madrid": "atletico madrid",
+    "atletico de madrid": "atletico madrid",
+    "real betis balompie": "real betis",
+    "rcd espanyol": "espanyol",
+    "deportivo alaves": "alaves",
+    # Italy
+    "inter milan": "inter",
+    "internazionale": "inter",
+    "internazionale milano": "inter",
+    "ac milan": "milan",
+    "juventus fc": "juventus",
+    "as roma": "roma",
+    "ss lazio": "lazio",
+    "acf fiorentina": "fiorentina",
+    "hellas verona": "verona",
+    # Germany
+    "borussia m'gladbach": "borussia monchengladbach",
+    "m'gladbach": "monchengladbach",
+    "bayer leverkusen": "leverkusen",
+    "hertha bsc": "hertha",
+    "vfb stuttgart": "stuttgart",
+    "tsg hoffenheim": "hoffenheim",
+    "sc freiburg": "freiburg",
+    "rb leipzig": "leipzig",
+    "eintracht frankfurt": "frankfurt",
+    "1. fc koln": "koln",
+    "1. fc union berlin": "union berlin",
+    "sv werder bremen": "werder bremen",
+    # France
+    "paris sg": "paris saint-germain",
+    "psg": "paris saint-germain",
+    "paris saint germain": "paris saint-germain",
+    "olympique de marseille": "marseille",
+    "olympique lyonnais": "lyon",
+    "as monaco fc": "monaco",
+    "ogc nice": "nice",
+    "stade rennais": "rennes",
+    "stade brestois": "brest",
+    "stade de reims": "reims",
+    # Netherlands
+    "psv eindhoven": "psv",
+    "ajax amsterdam": "ajax",
+    "az alkmaar": "az",
+    "feyenoord rotterdam": "feyenoord",
+    "fc twente": "twente",
+    "sc heerenveen": "heerenveen",
+    # Portugal
+    "sporting cp": "sporting",
+    "sporting clube de portugal": "sporting",
+    "sl benfica": "benfica",
+    "fc porto": "porto",
+    "sc braga": "braga",
+    # Turkey
+    "galatasaray sk": "galatasaray",
+    "fenerbahce sk": "fenerbahce",
+    "besiktas jk": "besiktas",
+    "trabzonspor as": "trabzonspor",
+    # Greece
+    "olympiakos": "olympiacos piraeus",
+    "olympiacos": "olympiacos piraeus",
+    "olympiakos piraeus": "olympiacos piraeus",
+    "paok salonika": "paok",
+    "paok thessaloniki": "paok",
+    # Romania
+    "din. bucuresti": "dinamo bucuresti",
+    "din bucuresti": "dinamo bucuresti",
+    "fcsb": "steaua bucuresti",
+    "fc steaua bucuresti": "steaua bucuresti",
+    # European cups (common TheOdds API variants)
+    "rb salzburg": "salzburg",
+    "red bull salzburg": "salzburg",
+    "shakhtar donetsk": "shakhtar",
+    "bsc young boys": "young boys",
+    "fc celtic": "celtic",
+    "celtic fc": "celtic",
+    "rangers fc": "rangers",
+    "sporting lisbon": "sporting",
+    "benfica": "benfica",
+    "porto": "porto",
+    # Belgium — Jupiler Pro League
+    "union saint-gilloise": "st. gilloise",
+    "royale union saint-gilloise": "st. gilloise",
+    "union sg": "st. gilloise",
+    # Standard Liège: TheOddsAPI sends "Standard Liège" → canon "standard liege";
+    # DB may store bare "Standard" → canon "standard". Token match {"standard","liege"}
+    # vs {"standard"} = 0.5 < 0.7 threshold → no match. Alias collapses all forms.
+    "standard liege": "standard",
+    "r. standard de liege": "standard",
+    "r standard de liege": "standard",
+    "standard de liege": "standard",
+    # Further Belgium aliases for completeness
+    "rsc anderlecht": "anderlecht",
+    "royale union sportive anderlecht": "anderlecht",
+    "club brugge kv": "club brugge",
+    "krc genk": "genk",
+    "kaa gent": "gent",
+    "oh leuven": "oud-heverlee leuven",
+    # Poland — Ekstraklasa (TheOdds API uses short name; DB stores API-Football display name)
+    "nieciecza": "termalica b-b.",
+    "bruk-bet termalica nieciecza": "termalica b-b.",
+    # Portugal — TheOddsAPI uses "Vitória SC" for Vitória SC Guimarães; DB stores "Guimaraes"
+    "vitoria sc": "guimaraes",
+    # Greece — DB stores short names; TheOddsAPI sends city-qualified names
+    "ofi crete": "ofi",
+    "ofi crete fc": "ofi",
+    "panserraikos fc": "panserraikos",
+    "panserraikos fc thessaloniki": "panserraikos",
+    # Netherlands — DB stores "PSV Eindhoven"; TheOdds may send bare "PSV"
+    "psv": "psv eindhoven",
+}
+
+def _strip_accents(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+#: Below this MEAN affinity a 1X2 market is refused rather than
+#: assigned. See the assignment block in `_save_game_odds`.
+_OUTCOME_MIN_AFFINITY = 0.30
+
+
+def _canon_team_name(n: str) -> str:
+    n = _strip_accents(n.lower().strip())
+    n = _ALIASES.get(n, n)
+    for suffix in (" fc", " cf", " sc", " ac", " fk", " sk", " bk",
+                   " city", " town", " united", " utd", " rovers",
+                   " wanderers", " athletic", " albion", " hotspur"):
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+            break
+    for prefix in ("fc ", "cf ", "sc ", "ac ", "fk ", "sk ", "bk ",
+                   "as ", "ss ", "us ", "rc ", "cd ", "ud ", "sd "):
+        if n.startswith(prefix):
+            n = n[len(prefix):].strip()
+            break
+    return n
+
+
+def _tok_match(ta: str, tb: str) -> bool:
+    """One token against another: equal, substring, or 0.75 sequence ratio.
+
+    THE SUBSTRING RULE IS WHY `_name_affinity` EXISTS. `"ce" in "ceuta"` is
+    True, so a one-token name scores a perfect token ratio against any name
+    carrying a prefix-compatible token. Kept here unchanged because fixture
+    matching depends on its exact behaviour; the outcome classifier no longer
+    uses it alone.
+    """
+    if ta == tb:
+        return True
+    if ta in tb or tb in ta:
+        return True
+    return SequenceMatcher(None, ta, tb).ratio() >= 0.75
+
+
+def _token_ratio(c_a: str, c_b: str) -> float:
+    t_a, t_b = set(c_a.split()), set(c_b.split())
+    shorter, longer = (t_a, t_b) if len(t_a) <= len(t_b) else (t_b, t_a)
+    if not shorter:
+        return 0.0
+    matches = sum(1 for tok in shorter
+                  if any(_tok_match(tok, long_tok) for long_tok in longer))
+    return matches / len(shorter)
+
+
+def _name_affinity(name_a: str, name_b: str) -> float:
+    """GRADED name similarity in [0, 1], for ASSIGNING outcomes to selections.
+
+    Added 2026-10-10. `_team_names_similar` answers "could these be the same
+    club" and is right for fixture matching, where it is applied as a
+    CONJUNCTION over home AND away and a false positive on one side is caught
+    by the other. It is wrong for classifying a market's outcomes, which is an
+    ASSIGNMENT problem: two outcomes, two teams, and the question is which
+    pairing is better — not whether each passes a threshold.
+
+    WHY THE SEQUENCE RATIO CARRIES THE DECISION. The token ratio saturates: for
+    Ceuta vs Sabadell it returns 1.0 for BOTH candidate pairings, because
+    `"ce"` is a substring of `"ceuta"` and the one-token side scores 1/1. The
+    sequence ratio separates them — 0.769 against 0.375 — so it is the primary
+    signal and token overlap only breaks ties.
+    """
+    if name_a == name_b:
+        return 1.0
+    c_a, c_b = _canon_team_name(name_a), _canon_team_name(name_b)
+    if c_a == c_b:
+        return 1.0
+    seq = SequenceMatcher(None, c_a, c_b).ratio()
+    return seq + 0.001 * _token_ratio(c_a, c_b)
+
+
+def _team_names_similar(name_a: str, name_b: str) -> bool:
+    """Reuse FlashscoreScraper's fuzzy match logic without importing the class.
+
+    Handles abbreviations, diacritics, prefixes/suffixes, and known aliases.
+    Returns True when two names likely refer to the same club.
+    """
+    if name_a == name_b:
+        return True
+
+    c_a, c_b = _canon_team_name(name_a), _canon_team_name(name_b)
+    if c_a == c_b:
+        return True
+    if SequenceMatcher(None, c_a, c_b).ratio() >= 0.75:
+        return True
+
+    # Token-based partial match
+    t_a, t_b = set(c_a.split()), set(c_b.split())
+    shorter, longer = (t_a, t_b) if len(t_a) <= len(t_b) else (t_b, t_a)
+    if not shorter:
+        return False
+
+    def _tok_match(ta: str, tb: str) -> bool:
+        if ta == tb:
+            return True
+        if ta in tb or tb in ta:
+            return True
+        return SequenceMatcher(None, ta, tb).ratio() >= 0.75
+
+    matches = sum(
+        1 for tok in shorter
+        if any(_tok_match(tok, long_tok) for long_tok in longer)
+    )
+    return matches / len(shorter) >= 0.7
+
+
+class TheOddsScraper:
+    """Fetches odds from The Odds API for leagues with today's fixtures only.
+
+    Budget: 1 API credit per league call. With ~28 supported leagues and 500
+    monthly credits, this comfortably covers daily runs even if all leagues
+    have fixtures simultaneously.
+    """
+
+    def __init__(self, config=None):
+        from src.utils.config import get_config
+        self.config = config or get_config()
+        self.api_key: str = os.environ.get("ODDS_API_KEY", "")
+        self.db = get_db()
+        self._remaining_requests: Optional[int] = None
+        self._used_requests: Optional[int] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(trust_env=True)  # honour HTTP(S)_PROXY
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    def _leagues_with_today_fixtures(self) -> List[str]:
+        """Return internal league keys that have at least one fixture today."""
+        today_start = datetime.combine(date.today(), datetime.min.time())
+        today_end = today_start + timedelta(days=1)
+
+        leagues_with_fixtures: Set[str] = set()
+        with self.db.get_session() as session:
+            rows = (
+                session.query(Match.league)
+                .filter(
+                    Match.is_fixture == True,
+                    Match.match_date >= today_start,
+                    Match.match_date < today_end,
+                )
+                .distinct()
+                .all()
+            )
+            leagues_with_fixtures = {r.league for r in rows}
+
+        # Only keep leagues that map to The Odds API sport keys
+        supported = [
+            league
+            for league in leagues_with_fixtures
+            if league in LEAGUE_TO_THEODDS_SPORT
+        ]
+        unsupported = sorted(leagues_with_fixtures - set(supported))
+        if unsupported:
+            logger.info(
+                f"TheOddsAPI: {len(supported)} leagues with today's fixtures "
+                f"(skipping {len(unsupported)} unsupported: {', '.join(unsupported)})"
+            )
+        else:
+            logger.info(
+                f"TheOddsAPI: {len(supported)} leagues with today's fixtures"
+            )
+        return supported
+
+    def _get_today_fixtures(self, league: str) -> List[Dict]:
+        """Return today's DB fixtures for a league with team names."""
+        today_start = datetime.combine(date.today(), datetime.min.time())
+        today_end = today_start + timedelta(days=1)
+
+        fixtures = []
+        with self.db.get_session() as session:
+            matches = (
+                session.query(Match)
+                .filter(
+                    Match.league == league,
+                    Match.is_fixture == True,
+                    Match.match_date >= today_start,
+                    Match.match_date < today_end,
+                )
+                .all()
+            )
+            for m in matches:
+                home_team = session.get(Team, m.home_team_id)
+                away_team = session.get(Team, m.away_team_id)
+                if home_team and away_team:
+                    fixtures.append({
+                        "match_id": m.id,
+                        "home_name": home_team.name,
+                        "away_name": away_team.name,
+                        "match_date": m.match_date,
+                    })
+        return fixtures
+
+    async def probe_credits(self) -> Optional[int]:
+        """Ask the provider what it has left. FREE — /v4/sports costs 0 credits.
+
+        The answer to "no reading" is to probe, not to skip. A skip on an absent
+        or stale figure trades a free question for a whole day of missing odds,
+        which is the wrong way round: the probe costs nothing and the skip costs
+        the card.
+
+        Returns remaining credits, or None if the probe itself could not answer
+        — and None here means the caller should PROCEED, because a failed probe
+        is not evidence of an empty tier either.
+        """
+        if not self.api_key:
+            return None
+        try:
+            session = await self._get_session()
+            async with session.get(
+                    f"{BASE_URL}/sports", params={"apiKey": self.api_key},
+                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                self._absorb_quota_headers(resp)
+                if resp.status == 200:
+                    return self._remaining_requests
+                logger.warning(
+                    f"TheOddsAPI: credit probe returned {resp.status}")
+                return self._remaining_requests
+        except Exception as e:
+            logger.warning(f"TheOddsAPI: credit probe failed ({e})")
+            return None
+
+    def _absorb_quota_headers(self, resp) -> None:
+        """Record the provider's own credit counters from ANY response.
+
+        Called BEFORE the status branches, and that ordering is the whole
+        point. The 429 branch used to `return` before this ran, so on the one
+        response that says "you are out of credits" the pipeline learned
+        nothing — `_used_requests` kept its last value and `quota.reconcile()`
+        was never handed the truth. The ledger went permanently blind at
+        exactly the moment its number mattered.
+
+        The counters live on error responses too; only a transport failure
+        carries none.
+        """
+        remaining = resp.headers.get("x-requests-remaining")
+        used = resp.headers.get("x-requests-used")
+        if remaining is not None:
+            try:
+                self._remaining_requests = int(remaining)
+            except (TypeError, ValueError) as exc:
+                # THE GATE'S OWN INPUT, DISCARDED. This `return` also skips
+                # `_persist_credits` and every tier warning below it, so a
+                # provider that starts sending a malformed header silently
+                # freezes the credit reading AND suppresses the alarms that
+                # would report it — the guard-degrades-in-the-condition-it-
+                # guards shape, on the gate itself.
+                logger.warning(
+                    f"TheOddsAPI: x-requests-remaining={remaining!r} is not an "
+                    f"integer ({exc}) — credit reading NOT updated and tier "
+                    f"warnings skipped for this response")
+                return
+            _persist_credits(self._remaining_requests)
+            _r = self._remaining_requests
+            if _r <= _CREDITS_TIER_CRITICAL:
+                logger.critical(
+                    f"TheOddsAPI CRITICAL: only {_r} credits remaining "
+                    f"— suspend non-essential league calls or add credits"
+                )
+            elif _r <= _CREDITS_TIER_WARNING:
+                logger.warning(
+                    f"TheOddsAPI WARNING: {_r} credits remaining (~2 days left)"
+                )
+            elif _r <= _CREDITS_TIER_INFO:
+                logger.info(
+                    f"TheOddsAPI: {_r} credits remaining (~3 days left)"
+                )
+        if used is not None:
+            try:
+                self._used_requests = int(used)
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    f"TheOddsAPI: x-requests-used={used!r} is not an integer "
+                    f"({exc}) — the reconciliation figure is stale for this "
+                    f"response")
+
+    async def _fetch_league_odds(self, sport_key: str):
+        """Call The Odds API for a single sport key.
+
+        Returns the raw list of game objects, a :class:`Refusal` when the
+        provider declined, or None on error. Tracks credits from the response
+        headers of EVERY response, including the ones that declined.
+        """
+        if not self.api_key:
+            logger.warning("TheOddsAPI: ODDS_API_KEY not set — skipping")
+            return None
+
+        url = f"{BASE_URL}/sports/{sport_key}/odds"
+        params = {
+            "apiKey": self.api_key,
+            "regions": "eu",
+            "markets": "h2h,totals",
+            "oddsFormat": "decimal",
+            "dateFormat": "iso",
+        }
+
+        session = await self._get_session()
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                # Headers FIRST — see _absorb_quota_headers. A declined
+                # response is the most informative one about the budget.
+                self._absorb_quota_headers(resp)
+
+                if resp.status == 401:
+                    logger.error("TheOddsAPI: invalid API key (401)")
+                    return None
+                if resp.status == 422:
+                    logger.debug(f"TheOddsAPI: sport key '{sport_key}' not found (422)")
+                    return None
+                if resp.status == 429:
+                    # 429 is "Too Many Requests", not "out of credits". Every
+                    # one of the six 429s in this project's history was the
+                    # former — 2026-09-05 logged four in a single second with
+                    # 362 credits remaining — and all six were reported as
+                    # "quota exhausted". An alarm that has cried wolf six times
+                    # cannot announce the real thing, so the two are separated
+                    # here by the only evidence that distinguishes them.
+                    rem = self._remaining_requests
+                    if rem is not None and rem <= 0:
+                        logger.critical(
+                            f"TheOddsAPI: QUOTA EXHAUSTED — 429 with "
+                            f"x-requests-remaining={rem}. No further request "
+                            f"can succeed until the monthly reset."
+                        )
+                        return Refusal(REFUSED_EXHAUSTED, sport_key)
+                    logger.warning(
+                        f"TheOddsAPI: RATE LIMITED (429) on '{sport_key}' — "
+                        f"{rem if rem is not None else 'unknown'} credits still "
+                        f"remaining, so this is request pacing, not the budget."
+                    )
+                    return Refusal(REFUSED_RATE_LIMITED, sport_key)
+                resp.raise_for_status()
+
+                data = await resp.json()
+                logger.debug(
+                    f"TheOddsAPI: fetched {len(data)} games for '{sport_key}' "
+                    f"(credits remaining: {self._remaining_requests})"
+                )
+                return data
+        except aiohttp.ClientError as e:
+            logger.warning(f"TheOddsAPI: request failed for '{sport_key}': {e}")
+            return None
+
+    def _find_matching_fixture(
+        self, api_home: str, api_away: str, db_fixtures: List[Dict]
+    ) -> Optional[int]:
+        """Return match_id of the DB fixture that matches the API game's team names."""
+        for fix in db_fixtures:
+            if (_team_names_similar(api_home, fix["home_name"]) and
+                    _team_names_similar(api_away, fix["away_name"])):
+                return fix["match_id"]
+        return None
+
+    def _save_game_odds(self, game: Dict, match_id: int, saved: List[str],
+                        session=None, existing_index: Optional[dict] = None) -> int:
+        """Parse one API game object and upsert odds rows into DB.
+
+        When `session` is provided the caller owns the transaction and is
+        responsible for committing.  When None (legacy), opens its own session
+        and commits once per game (not once per row as before).
+
+        `existing_index` (keyed by (match_id, bm, market, selection)) is passed
+        to _upsert_odds to avoid per-row SELECT queries when provided.
+
+        Returns count of odds rows written.
+        """
+        written = 0
+        bookmakers = game.get("bookmakers", [])
+        if not bookmakers:
+            return 0
+
+        def _process(sess):
+            nonlocal written
+            for bm in bookmakers:
+                bm_key = f"{BOOKMAKER_PREFIX}-{bm['key']}"
+                for market in bm.get("markets", []):
+                    market_key = market["key"]  # "h2h" or "totals"
+
+                    if market_key == "h2h":
+                        # ── ASSIGNMENT, NOT FIRST-THRESHOLD-WINS (2026-10-10) ──
+                        #
+                        # THE DEFECT THIS REPLACES, measured in production: the
+                        # old chain tested `_team_names_similar(oname,
+                        # home_name)` FIRST, so any outcome whose name fuzzily
+                        # matched the HOME name was written as "Home" — including
+                        # the AWAY team's outcome. `_tok_match` accepts substring
+                        # containment, so `"ce"` matches `"ceuta"` and a
+                        # one-token name scores 1/1. Ceuta vs Sabadell therefore
+                        # wrote TWO "Home" rows and NO "Away" row.
+                        #
+                        # BLAST RADIUS, 2026-10-10: 486 (match, bookmaker) keys
+                        # across 28 matches carry 1X2 with Home present and Away
+                        # ABSENT, and `missing_HOME` is exactly 0 — the
+                        # directionality the `elif` order predicts. 12 of the 28
+                        # carry a saved pick, 4 of them on today's card. In
+                        # `odds` the second write UPDATES the first, so the live
+                        # Home price was the AWAY team's price.
+                        #
+                        # WHY ASSIGNMENT IS THE RIGHT SHAPE. Two outcomes, two
+                        # teams: the question is which PAIRING is better, not
+                        # whether each name passes a threshold. The game was
+                        # already matched to this fixture upstream by
+                        # `_team_names_similar` applied as a CONJUNCTION over
+                        # home AND away, so identity is established before we
+                        # get here and this step only has to order the two.
+                        home_name = game.get("home_team", "")
+                        away_name = game.get("away_team", "")
+                        draw_price = None
+                        team_outcomes = []
+                        for outcome in market.get("outcomes", []):
+                            oname = (outcome.get("name") or "").strip()
+                            oprice = outcome.get("price")
+                            if oprice is None:
+                                continue
+                            if oname.lower() == "draw":
+                                draw_price = oprice
+                            else:
+                                team_outcomes.append((oname, oprice))
+
+                        picked = {}
+                        if len(team_outcomes) == 2:
+                            (n1, p1), (n2, p2) = team_outcomes
+                            direct = (_name_affinity(n1, home_name)
+                                      + _name_affinity(n2, away_name))
+                            swap = (_name_affinity(n1, away_name)
+                                    + _name_affinity(n2, home_name))
+                            # A TIE REFUSES. It does not fall back to payload
+                            # order, and that is a decision taken on a measured
+                            # case: `Dundee Utd` vs `Dundee FC` scores a margin
+                            # of EXACTLY 0.0000, because `_canon_team_name`
+                            # strips both " utd" and " fc" and both names
+                            # canonicalise to "dundee". With `>=` the tie broke
+                            # silently toward the API's outcome ORDER — correct
+                            # only if that order is guaranteed, which nothing
+                            # here verifies. Of 26 affected pairs and 60
+                            # previously-correct pairs replayed, this is the
+                            # ONLY tie (control min margin 1.0000), so refusing
+                            # costs one derby's 1X2 and removes a silent
+                            # wrong-side write.
+                            if direct > swap:
+                                picked["Home"], picked["Away"] = p1, p2
+                            elif swap > direct:
+                                picked["Home"], picked["Away"] = p2, p1
+                            else:
+                                picked = {}
+                                self._h2h_unassigned = getattr(
+                                    self, "_h2h_unassigned", 0) + 1
+                                logger.warning(
+                                    f"TheOddsAPI 1X2 TIE for match {match_id} / "
+                                    f"{bm_key}: {[n for n, _ in team_outcomes]!r} "
+                                    f"score identically against {home_name!r} vs "
+                                    f"{away_name!r} — the names cannot "
+                                    f"distinguish the sides, so no 1X2 is "
+                                    f"written rather than one chosen by order")
+                            # A SAFETY NET, NOT THE DECISION. The argmax is
+                            # correct whatever the absolute scores; this only
+                            # refuses a market that is not a two-team h2h at
+                            # all. Deliberately low, because the API's naming
+                            # can differ sharply from the DB's and dropping a
+                            # real market costs a price.
+                            if picked and max(direct, swap) / 2.0 < _OUTCOME_MIN_AFFINITY:
+                                picked = {}
+                                self._h2h_unassigned = getattr(
+                                    self, "_h2h_unassigned", 0) + 1
+                                logger.warning(
+                                    f"TheOddsAPI 1X2 REFUSED for match "
+                                    f"{match_id} / {bm_key}: outcomes "
+                                    f"{[n for n, _ in team_outcomes]!r} score "
+                                    f"{max(direct, swap) / 2.0:.2f} against "
+                                    f"{home_name!r} vs {away_name!r} — writing "
+                                    f"no 1X2 rather than a guessed side")
+                        elif team_outcomes:
+                            # NOT A ZERO AND NOT A GUESS. One or three+ team
+                            # outcomes is a market shape we do not understand;
+                            # counted and named rather than partially written.
+                            self._h2h_unassigned = getattr(
+                                self, "_h2h_unassigned", 0) + 1
+                            logger.warning(
+                                f"TheOddsAPI 1X2 SKIPPED for match {match_id} / "
+                                f"{bm_key}: {len(team_outcomes)} non-draw "
+                                f"outcome(s), expected 2 — "
+                                f"{[n for n, _ in team_outcomes]!r}")
+                        if draw_price is not None:
+                            picked["Draw"] = draw_price
+
+                        for selection, oprice in picked.items():
+                            written += self._upsert_odds(
+                                sess, match_id, bm_key, "1X2", selection, oprice,
+                                existing_index=existing_index,
+                            )
+
+                    elif market_key == "totals":
+                        for outcome in market.get("outcomes", []):
+                            direction = outcome.get("name", "")
+                            point = outcome.get("point")
+                            oprice = outcome.get("price")
+                            if direction not in ("Over", "Under") or point is None or oprice is None:
+                                continue
+                            selection = f"{direction} {point}"
+                            written += self._upsert_odds(
+                                sess, match_id, bm_key, "over_under", selection, oprice,
+                                existing_index=existing_index,
+                            )
+
+        if session is not None:
+            _process(session)
+        else:
+            # Legacy path: own session, single commit per game (not per row)
+            with self.db.get_session() as sess:
+                try:
+                    _process(sess)
+                    sess.commit()
+                except Exception as e:
+                    sess.rollback()
+                    logger.warning(f"TheOddsAPI game save failed for match_id={match_id}: {e}")
+                    return 0
+
+        return written
+
+    def _upsert_odds(
+        self,
+        session,
+        match_id: int,
+        bookmaker: str,
+        market_type: str,
+        selection: str,
+        odds_value: float,
+        existing_index: Optional[dict] = None,
+    ) -> int:
+        """Insert-or-update a single Odds row. Returns 1 if written, 0 otherwise.
+
+        When `existing_index` is provided (keyed by (match_id, bookmaker,
+        market_type, selection)) the existence check is done in-memory instead
+        of firing a SELECT per row — reduces Neon roundtrips from N_rows to 0.
+
+        Does NOT commit — caller is responsible for a single commit per game/league.
+        """
+        try:
+            key = (match_id, bookmaker, market_type, selection)
+            if existing_index is not None:
+                existing = existing_index.get(key)
+            else:
+                existing = (
+                    session.query(Odds)
+                    .filter_by(
+                        match_id=match_id,
+                        bookmaker=bookmaker,
+                        market_type=market_type,
+                        selection=selection,
+                    )
+                    .first()
+                )
+            _now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if existing:
+                existing.odds_value = odds_value
+                existing.timestamp = _now
+            else:
+                new_row = Odds(
+                    match_id=match_id,
+                    bookmaker=bookmaker,
+                    market_type=market_type,
+                    selection=selection,
+                    odds_value=odds_value,
+                    opening_odds=odds_value,
+                    first_seen_at=_now,
+                )
+                session.add(new_row)
+                if existing_index is not None:
+                    existing_index[key] = new_row  # prevent re-insert on dup
+
+            # Stage 18 C1: append the observation to the price PATH. Every
+            # write, insert or update — an update is exactly the observation
+            # that overwrite semantics used to destroy. Fails open.
+            _record_price(session, match_id=match_id, bookmaker=bookmaker,
+                          market_type=market_type, selection=selection,
+                          odds_value=odds_value, observed_at=_now)
+            return 1
+        except Exception as e:
+            logger.warning(f"TheOddsAPI upsert failed ({bookmaker} / {market_type} / {selection}): {e}")
+            return 0
+
+    async def update(self) -> int:
+        """Fetch odds for all leagues with today's fixtures.
+
+        Performance optimisations vs the old sequential approach:
+        - All HTTP requests are fired concurrently (asyncio.gather).
+        - DB writes use one session per league with a single commit, instead
+          of one session and one commit per odds row (the old hot path had
+          90+ commits per game × 14 leagues = ~1,000+ Neon roundtrips).
+
+        Returns total count of odds rows written.
+        """
+        if not self.api_key:
+            logger.info("TheOddsAPI: ODDS_API_KEY not configured — skipping")
+            return 0
+
+        # Hard gate: if last-known credits are below the gate threshold, skip
+        # entirely rather than burning the last few credits and going silent.
+        # `_load_persisted_credits` returns None for BOTH "no file" and "a file
+        # from a previous billing period". Either way the honest state is "we do
+        # not know", and the response to not knowing is to ask — /v4/sports is
+        # free. Skipping on an unknown figure is what would have lost 1 October
+        # to a number describing September.
+        _persisted = _load_persisted_credits()
+        if _persisted is None:
+            _probed = await self.probe_credits()
+            if _probed is not None:
+                logger.info(
+                    f"TheOddsAPI: no current-period credit reading — probed "
+                    f"/v4/sports (free): {_probed} remaining")
+                _persisted = _probed
+        if _persisted is not None and _persisted <= _CREDITS_GATE_THRESHOLD:
+            logger.warning(
+                f"TheOddsAPI: skipping update — only {_persisted} credits remain "
+                f"(gate threshold: {_CREDITS_GATE_THRESHOLD}). "
+                f"Add credits or wait for monthly reset."
+            )
+            return 0
+
+        leagues = self._leagues_with_today_fixtures()
+        if not leagues:
+            logger.info("TheOddsAPI: no leagues with today's fixtures — skipping")
+            return 0
+
+        # Gather DB fixtures for all leagues up front (sequential — fast, no HTTP)
+        league_fixtures: Dict[str, List[Dict]] = {}
+        for league in leagues:
+            fixtures = self._get_today_fixtures(league)
+            if fixtures:
+                league_fixtures[league] = fixtures
+            else:
+                logger.debug(f"TheOddsAPI: no DB fixtures for '{league}', skipping API call")
+
+        if not league_fixtures:
+            return 0
+
+        # ONE ACCOUNT FOR BOTH CONSUMERS. Until 2026-09-10 this call passed no
+        # quota, so it claimed nothing, could not be declined, and never
+        # reconciled. Measured over 2026-09-01..09-10 it was 204 of the 346
+        # credits the provider actually charged — 59% of consumption invisible
+        # to the mechanism built to bound it, and the reason the ledger and the
+        # provider diverged on 7 of 13 spending runs.
+        #
+        # The ledger's arithmetic was never wrong. A second consumer bypassed
+        # it. Same one-definition move as the shared live_only()/
+        # valid_evidence() predicates and OVERROUND_3WAY after Stage 18 found
+        # three copies drifting apart.
+        #
+        # max_credits_per_run=0 DISABLES the per-run ceiling on purpose. The
+        # 24-credit default is sized for the imminent-refresh job; applying it
+        # here would decline roughly half of every day's leagues (this path
+        # routinely wants 20-23 = 40-46 credits) and that is a volume change,
+        # not an accounting fix. The monthly budget still gates it, which is
+        # the boundary this change exists to make visible.
+        quota = None
+        try:
+            from src.data.odds_quota import OddsApiQuota
+            quota = OddsApiQuota(
+                self.db,
+                monthly_budget=int(self.config.get(
+                    "odds_api.monthly_credit_budget", 400)),
+                safety_margin=int(self.config.get(
+                    "odds_api.safety_margin_credits", 50)),
+                max_credits_per_run=0,
+            )
+        except Exception as e:
+            # Fail OPEN, matching claim_requests' own behaviour when the
+            # api_budget table is unavailable: a broken ledger must not stop
+            # the pipeline pricing today's card. It is logged loudly because a
+            # silent fall-back here restores exactly the blind spot this
+            # change closes.
+            logger.error(
+                f"TheOddsAPI: could not build the credit ledger ({e}) — "
+                f"proceeding UNMETERED, which is the pre-2026-09-10 behaviour")
+
+        return await self._fetch_and_persist(league_fixtures, quota=quota)
+
+    async def _fetch_and_persist(self, league_fixtures: Dict[str, List[Dict]],
+                                 quota=None) -> int:
+        """Fetch odds for the given leagues and persist them.
+
+        Extracted from ``update()`` so the Stage 6 imminent-fixture refresh
+        can reuse the identical fetch/match/persist path. Splitting it was the
+        alternative to duplicating ~140 lines of team-name matching and upsert
+        logic, which would have drifted.
+
+        Args:
+            league_fixtures: internal league key -> DB fixtures to match against.
+            quota: optional OddsApiQuota. When supplied, budget for exactly
+                len(league_fixtures) requests is CLAIMED BEFORE any HTTP call,
+                and the league set is truncated to what the budget grants.
+        """
+        if not league_fixtures:
+            return 0
+
+        if quota is not None:
+            wanted = list(league_fixtures)
+            granted = quota.claim_requests(len(wanted))
+            if granted <= 0:
+                logger.warning(
+                    "TheOddsAPI: monthly credit budget exhausted — making NO "
+                    "requests this run. " + quota.describe())
+                return 0
+            if granted < len(wanted):
+                dropped = wanted[granted:]
+                league_fixtures = {l: league_fixtures[l] for l in wanted[:granted]}
+                logger.warning(
+                    f"TheOddsAPI: budget allows {granted}/{len(wanted)} league "
+                    f"request(s); skipping {dropped} this run")
+
+        # Fire all HTTP requests concurrently — reduces wall time from
+        # 14× single-request latency to ~1× single-request latency.
+        sport_keys = [LEAGUE_TO_THEODDS_SPORT[l] for l in league_fixtures]
+        raw_results = await asyncio.gather(
+            *[self._fetch_league_odds(sk) for sk in sport_keys],
+            return_exceptions=True,
+        )
+        league_games: Dict[str, Optional[List[Dict]]] = {}
+        for league, result in zip(league_fixtures, raw_results):
+            if isinstance(result, Exception):
+                logger.warning(f"TheOddsAPI: fetch failed for '{league}': {result}")
+                league_games[league] = None
+            else:
+                league_games[league] = result
+
+        # Per-league outcome, recorded because the aggregate hid it. The
+        # attribution log in refresh_imminent used to derive `result=` from the
+        # TOTAL rows written across the whole batch, so a batch where one league
+        # returned rows and three returned nothing emitted four `result=ok`
+        # lines. Every no_rows figure ever read out of those logs is therefore a
+        # LOWER bound on the waste, including Stage 15's.
+        self._last_league_outcomes = {
+            lg: _outcome_of(games) for lg, games in league_games.items()
+        }
+
+        # A refusal is not an absence of odds. Surface it HERE, on the path
+        # `update()` uses, because `_last_league_outcomes` is otherwise read
+        # only by `refresh_imminent` — so on the daily-picks path the
+        # distinction between "no odds exist" and "we were refused" was
+        # computed and thrown away, and the summary read `0 odds rows written`
+        # either way.
+        _refused = {lg: o for lg, o in self._last_league_outcomes.items()
+                    if o.startswith("refused_")}
+        if _refused:
+            _exh = [lg for lg, o in _refused.items() if o == REFUSED_EXHAUSTED]
+            if _exh:
+                logger.critical(
+                    f"TheOddsAPI: {len(_exh)} league(s) REFUSED FOR QUOTA "
+                    f"EXHAUSTION and produced no odds: {sorted(_exh)}. "
+                    f"Any pick priced from these leagues used stale or missing "
+                    f"odds."
+                )
+            _rl = [lg for lg, o in _refused.items() if o == REFUSED_RATE_LIMITED]
+            if _rl:
+                logger.warning(
+                    f"TheOddsAPI: {len(_rl)} league(s) RATE LIMITED and produced "
+                    f"no odds this run: {sorted(_rl)}. Credits remain; this is "
+                    f"pacing."
+                )
+        # Leagues that returned a clean empty list, stated separately so a zero
+        # is never read as a refusal or the reverse.
+        _empty = [lg for lg, o in self._last_league_outcomes.items()
+                  if o == "no_rows"]
+        if _empty:
+            logger.info(
+                f"TheOddsAPI: {len(_empty)} league(s) returned an empty event "
+                f"list (priced nothing): {sorted(_empty)}")
+
+        # Reconcile HERE rather than only in refresh_imminent, so both
+        # consumers correct the ledger against the provider's own counter.
+        # `reconcile` only ever raises and returns early when the provider's
+        # number is not higher, so refresh_imminent's later call on the same
+        # figure is a no-op. Reachable on the exhaustion path now that the 429
+        # branch absorbs headers before returning.
+        if quota is not None and self._used_requests is not None:
+            quota.reconcile(self._used_requests)
+
+        total_written = 0
+        matched_games = 0
+        unmatched_games = 0
+        unmatched_details: List[str] = []
+
+        # The window used to decide whether an API game is one we care about.
+        # Derived from the fixtures the caller passed in rather than hard-coded
+        # to "today": the Stage 6 imminent refresh can run at 23:00 UTC and
+        # legitimately want a 00:30 kickoff, which a today-only window drops.
+        # For update(), whose fixtures are all today, this is the same window.
+        _fixture_kos = [
+            f["match_date"] for fixes in league_fixtures.values() for f in fixes
+            if f.get("match_date")
+        ]
+        if _fixture_kos:
+            window_start = min(_fixture_kos) - timedelta(hours=1)
+            window_end = max(_fixture_kos) + timedelta(hours=1)
+        else:
+            window_start = datetime.combine(date.today(), datetime.min.time())
+            window_end = window_start + timedelta(days=1)
+
+        for league, games in league_games.items():
+            # Named explicitly rather than relying on falsiness. `Refusal` is
+            # deliberately truthy so this line cannot silently absorb it the
+            # way `not games` absorbs `[]` and `None`.
+            if isinstance(games, Refusal) or not games:
+                continue
+
+            db_fixtures = league_fixtures[league]
+            match_ids = [fix["match_id"] for fix in db_fixtures]
+            league_unmatched = 0
+            saved_match_ids: List[str] = []
+
+            # One DB session for the entire league — single commit at the end
+            with self.db.get_session() as session:
+                try:
+                    # Preload ALL existing odds for this league's matches in one
+                    # query instead of one SELECT per row — reduces Neon roundtrips
+                    # from N_odds_rows to 1 per league.
+                    existing_rows = session.query(Odds).filter(
+                        id_in(session, Odds.match_id, match_ids)
+                    ).all()
+                    existing_index = {
+                        (r.match_id, r.bookmaker, r.market_type, r.selection): r
+                        for r in existing_rows
+                    }
+
+                    for game in games:
+                        api_home = game.get("home_team", "")
+                        api_away = game.get("away_team", "")
+
+                        commence_raw = game.get("commence_time", "")
+                        is_today = False
+                        if commence_raw:
+                            try:
+                                from datetime import timezone as _tz
+                                ct = datetime.fromisoformat(commence_raw.replace("Z", "+00:00"))
+                                ct_naive = ct.astimezone(_tz.utc).replace(tzinfo=None)
+                                is_today = window_start <= ct_naive < window_end
+                            except Exception:
+                                is_today = True
+
+                        match_id = self._find_matching_fixture(api_home, api_away, db_fixtures)
+
+                        if match_id is None:
+                            if is_today:
+                                unmatched_games += 1
+                                league_unmatched += 1
+                                unmatched_details.append(
+                                    f"  [{league}] '{api_home}' vs '{api_away}'"
+                                )
+                            continue
+
+                        matched_games += 1
+                        n = self._save_game_odds(
+                            game, match_id, saved_match_ids,
+                            session=session, existing_index=existing_index,
+                        )
+                        total_written += n
+                        logger.debug(
+                            f"TheOddsAPI: {api_home} vs {api_away} → match_id={match_id}, "
+                            f"{n} odds rows staged"
+                        )
+
+                    session.commit()
+                except Exception as e:
+                    session.rollback()
+                    logger.warning(f"TheOddsAPI: DB write failed for league '{league}': {e}")
+
+            if league_unmatched:
+                logger.debug(f"TheOddsAPI: {league_unmatched} unmatched in '{league}'")
+
+            # Cooperative yield — lets asyncio.wait_for(timeout=300) fire between
+            # leagues rather than being blocked by the synchronous DB write loop.
+            await asyncio.sleep(0)
+
+        logger.info(
+            f"TheOddsAPI update complete: {total_written} odds rows written, "
+            f"{matched_games} games matched, {unmatched_games} unmatched "
+            f"(credits remaining: {self._remaining_requests})"
+        )
+        if unmatched_details:
+            logger.warning(
+                f"TheOddsAPI: {unmatched_games} games could not be matched to DB fixtures "
+                f"(team name mismatch) — add aliases to fix:\n" + "\n".join(unmatched_details)
+            )
+        return total_written
+
+    # ------------------------------------------------------------------------
+    # Stage 6 — imminent-fixture refresh
+    # ------------------------------------------------------------------------
+
+    def _imminent_league_fixtures(self, window_minutes: int, now=None,
+                                  require_pending_pick: bool = True):
+        """Leagues whose fixtures kick off inside the window, most urgent first.
+
+        Returns ``(league_fixtures, skip_reasons)``.
+
+        A league is worth a credit only when refreshing it can actually produce
+        a closing line. Measured on production history: ~3.6 mapped leagues per
+        day carry a pending pick, against ~7.2 with any fixture and 27
+        configured. That gap is the entire Stage 6 saving.
+
+        Egress: two projected queries over the handful of fixtures in the
+        window, using the existing ``ix_match_fixture_date`` index — not
+        ``SELECT matches.*`` across a whole day, and no per-fixture team lookup.
+        """
+        now = now or utcnow()
+        horizon = now + timedelta(minutes=window_minutes)
+        skips = {}
+
+        with self.db.get_session() as session:
+            rows = (
+                session.query(
+                    Match.id, Match.league, Match.match_date,
+                    Team.name.label("home_name"),
+                )
+                .join(Team, Team.id == Match.home_team_id)
+                .filter(
+                    Match.is_fixture == True,  # noqa: E712
+                    Match.match_date > now,
+                    Match.match_date <= horizon,
+                )
+                .all()
+            )
+            if not rows:
+                # ── THE THIRD REASON, AND THE ONE THAT ACTUALLY BIT. ──────
+                #
+                # This returned an EMPTY skips dict, so the caller logged
+                # "0 league(s) skipped" - a count of nothing, for the one
+                # outcome that needed explaining. On 2026-10-13/14/15 H1
+                # reached here three times and the log said `nothing to do`.
+                #
+                # The counts below are captured HERE, at the moment of the
+                # decision, because the state does not survive: the post-picks
+                # results scrape flips `is_fixture` from true to false, and by
+                # the time the question was asked all three days read
+                # `is_fixture = 0` and the reason was unrecoverable.
+                day_lo = now.replace(hour=0, minute=0, second=0,
+                                     microsecond=0)
+                day_hi = day_lo + timedelta(days=2)
+                total = (session.query(Match.id)
+                         .filter(Match.match_date >= day_lo,
+                                 Match.match_date < day_hi).count())
+                as_fixture = (session.query(Match.id)
+                              .filter(Match.match_date >= day_lo,
+                                      Match.match_date < day_hi,
+                                      Match.is_fixture == True).count())  # noqa: E712
+                future = (session.query(Match.id)
+                          .filter(Match.match_date > now,
+                                  Match.is_fixture == True).count())  # noqa: E712
+                skips["*"] = (
+                    f"NO FIXTURE IN THE WINDOW: 0 rows matched "
+                    f"is_fixture AND {now:%H:%M} < kickoff <= "
+                    f"{horizon:%H:%M}. State at this instant: {total} row(s) "
+                    f"across today+tomorrow, {as_fixture} of them "
+                    f"is_fixture, {future} future fixture(s) at any horizon. "
+                    f"A zero here is the CARD, not the selection.")
+                return {}, skips
+
+            match_ids = [r.id for r in rows]
+            away = dict(
+                session.query(Match.id, Team.name)
+                .join(Team, Team.id == Match.away_team_id)
+                .filter(id_in(session, Match.id, match_ids))
+                .all()
+            )
+            pending = {
+                mid for (mid,) in session.query(SavedPick.match_id).filter(
+                    id_in(session, SavedPick.match_id, match_ids),
+                    SavedPick.closing_odds.is_(None),
+                    SavedPick.closing_capture_status == "pending",
+                ).distinct().all()
+            }
+
+        by_league = {}
+        for r in rows:
+            league = r.league or ""
+            if league not in LEAGUE_TO_THEODDS_SPORT:
+                skips.setdefault(league, "not mapped to a The Odds API sport key")
+                continue
+            if require_pending_pick and r.id not in pending:
+                skips.setdefault(league, "no pending pick awaiting a closing line")
+                continue
+            by_league.setdefault(league, []).append({
+                "match_id": r.id,
+                "home_name": r.home_name,
+                "away_name": away.get(r.id, ""),
+                "match_date": r.match_date,
+            })
+
+        # A league that qualified must not also be reported as skipped.
+        for league in by_league:
+            skips.pop(league, None)
+
+        # Soonest kickoff first, so a truncated budget keeps the urgent ones.
+        ordered = sorted(by_league.items(),
+                         key=lambda kv: min(f["match_date"] for f in kv[1]))
+        return dict(ordered), skips
+
+    def _leagues_refreshed_since(self, leagues, since):
+        """Leagues whose Odds-API rows already carry a timestamp >= ``since``.
+
+        Deduplication is derived from the odds table, not a state file: it is
+        authoritative, survives loss of the GitHub Actions cache, and cannot
+        disagree with what was actually stored. One projected aggregate query.
+        """
+        if not leagues:
+            return set()
+        from sqlalchemy import func as _func
+
+        with self.db.get_session() as session:
+            rows = (
+                session.query(Match.league, _func.max(Odds.timestamp))
+                .join(Odds, Odds.match_id == Match.id)
+                .filter(
+                    id_in(session, Match.league, list(leagues)),
+                    Odds.bookmaker.like(BOOKMAKER_PREFIX + "%"),
+                    Odds.timestamp >= since,
+                )
+                .group_by(Match.league)
+                .all()
+            )
+        return {lg for lg, ts in rows if ts is not None}
+
+    def _leagues_a_pending_run_could_price(self, leagues, now) -> dict:
+        """`{league: reason}` for leagues a PENDING picks run could still price.
+
+        Empty when no run is pending — which is the common case and the one the
+        reverted guard got wrong.
+
+        FAILS OPEN, DELIBERATELY. The exposure this prevents is conditional on a
+        scheduler delay past ~7h40m; blocking every capture on a database hiccup
+        costs more than it prevents, and that trade is what the 2026-09-04
+        revert measured. A guard that cannot answer proceeds, loudly.
+        """
+        if not leagues:
+            return {}
+        # 1. TIME BOUND FIRST, and it is cheap. Outside the window no picks run
+        #    can be pending, whatever the database says — this is the condition
+        #    whose absence stopped captures for a full day.
+        if not _picks_run_may_be_pending(now):
+            return {}
+        try:
+            from sqlalchemy import func
+            with self.db.get_session() as session:
+                # 2. Has today's run produced ANY output? One pick anywhere
+                #    means the pass has run; the guard stands down immediately.
+                #    This is data, not a marker, and it cannot go stale.
+                produced = session.query(func.count(SavedPick.id)).filter(
+                    SavedPick.pick_date == now.date()).scalar() or 0
+                if produced:
+                    return {}
+                # 3. PER LEAGUE: does it still hold a fixture this run would
+                #    price — future kickoff, no pick on it yet?
+                rows = session.query(Match.league, func.count(Match.id)).filter(
+                    Match.league.in_(list(leagues)),
+                    Match.match_date > now,
+                    ~Match.id.in_(session.query(SavedPick.match_id)),
+                ).group_by(Match.league).all()
+        except Exception as exc:
+            logger.warning(
+                f"picks-run guard could not evaluate ({exc}) — PROCEEDING. "
+                f"The exposure it prevents is conditional; blocking every "
+                f"capture on a database error is not.")
+            return {}
+        return {
+            lg: (f"a picks run is pending and {lg} still holds {n} unpicked "
+                 f"fixture(s) it would price — refreshing now could change a "
+                 f"price that run reads")
+            for lg, n in rows if n
+        }
+
+    async def refresh_imminent(self, window_minutes: int = 120,
+                               min_interval_minutes: int = 180,
+                               quota=None,
+                               require_pending_pick: bool = True,
+                               dry_run: bool = False,
+                               now=None,
+                               h1_collection: bool = False,
+                               h1_since=None,
+                               leagues=None) -> dict:
+        """Refresh odds only for leagues with imminent fixtures worth a credit.
+
+        This never widens what counts as a valid closing line — it only changes
+        WHICH odds are fresh enough for ``capture_closing_lines`` to accept.
+
+        ``now`` is injectable so the selection and dedup windows can be tested
+        deterministically instead of against the wall clock.
+
+        H1 REQUIREMENT 1 (Stage 26, un-suspended 2026-10-01). ``h1_collection``
+        binds the ENFORCED STOP: before anything is spent, the collection halts
+        when ``n >= TARGET_N`` or when credits reach ``CREDIT_CEILING``. The
+        constants and the decision both come from
+        ``scripts.h1_collection_check`` — the runner imports them, it does not
+        keep a copy, because a second copy of a registered constant is the
+        seventh instance of THE HABIT.
+
+        THE CEILING IS COLLECTION-SCOPED, NOT GLOBAL. 200 credits is a bound on
+        H1's spend, not on the month's ordinary pricing, so the stop must not be
+        evaluated on normal refreshes — it would halt the pipeline the moment
+        routine spend passed 200.
+
+        WHICH LEAVES THE FLAG AS A SINGLE POINT OF FORGETTING, so it is not left
+        as one: H1-SHAPED PARAMETERS WITHOUT THE FLAG ARE REFUSED. Stage 26's
+        collection widens the window to 360 and drops the interval to 120, and a
+        caller that sets those without ``h1_collection=True`` gets no stop at
+        all — exactly the shape where an advisory guard became a no-op. So the
+        parameters themselves demand the flag.
+        """
+        from src.data.odds_quota import CREDITS_PER_REQUEST, credits_for
+
+        now = now or utcnow()
+
+        # ── the H1 stop, evaluated BEFORE any spend ──────────────────────────
+        #
+        # A DRY RUN IS EXEMPT, and that is on the merits rather than to quiet a
+        # test: `dry_run=True` returns above `_fetch_and_persist`, so it cannot
+        # spend, and a stop that guards spending has nothing to guard. The first
+        # version of this check refused `test_dry_run_spends_nothing`
+        # (window=1440, interval=0) — the suite caught a guard that would have
+        # broken a legitimate caller.
+        #
+        # The shape test stays DELIBERATELY BROAD (any window >= 360, any
+        # positive interval <= 120, not just the registered 360/120 pair). Fail
+        # closed: a caller inventing its own wide window is also spending without
+        # a ceiling, and the only false positive was the dry run.
+        h1_shaped = window_minutes >= 360 or 0 < min_interval_minutes <= 120
+        if h1_shaped and not h1_collection and not dry_run:
+            raise ValueError(
+                f"refresh_imminent called with H1 collection parameters "
+                f"(window={window_minutes}, min_interval={min_interval_minutes}) "
+                f"but h1_collection=False, so TARGET_N/CREDIT_CEILING would not "
+                f"be enforced. Pass h1_collection=True — the stop is the whole "
+                f"reason Stage 26 was un-suspended.")
+        if h1_collection:
+            from scripts.h1_collection_check import collection_state
+            from src.data.database import get_db
+            # The collection window starts at the monthly RESET, which is the
+            # only reason month-to-date credits equal collection-to-date
+            # credits. The check names that coincidence rather than assuming it,
+            # and so does this.
+            _since = h1_since or now.replace(day=1, hour=0, minute=0,
+                                             second=0, microsecond=0)
+            try:
+                with get_db().get_session() as _s:
+                    stop = collection_state(_s, _since)
+            except Exception as exc:
+                # FAIL CLOSED. A stop that cannot be evaluated is not a stop
+                # that passed.
+                plan = {"now": now.isoformat(), "h1_stop": "UNEVALUATED",
+                        "halted": True, "requested": [], "skipped": {},
+                        "credits_estimated": 0, "credits_claimed": 0,
+                        "odds_written": 0}
+                logger.error(
+                    f"H1_STOP state=UNEVALUATED halt=True reason=could not "
+                    f"evaluate the stop ({type(exc).__name__}: {exc}) — "
+                    f"refusing to spend")
+                return plan
+            logger.info(str(stop))
+            if stop.halt:
+                logger.warning(
+                    f"H1 COLLECTION HALTED — {stop.state}. No request made. "
+                    f"{stop.reason}")
+                return {"now": now.isoformat(), "h1_stop": stop.state,
+                        "halted": True, "h1_reason": stop.reason,
+                        "requested": [], "skipped": {},
+                        "credits_estimated": 0, "credits_claimed": 0,
+                        "odds_written": 0}
+        plan = {
+            "now": now.isoformat(),
+            "window_minutes": window_minutes,
+            "min_interval_minutes": min_interval_minutes,
+            "candidates": [], "requested": [], "skipped": {},
+            "credits_estimated": 0, "credits_claimed": 0,
+            "odds_written": 0, "dry_run": dry_run,
+        }
+        if not self.api_key:
+            plan["skipped"]["*"] = "ODDS_API_KEY not configured"
+            logger.info("TheOddsAPI: ODDS_API_KEY not configured — skipping")
+            return plan
+
+        league_fixtures, skips = self._imminent_league_fixtures(
+            window_minutes, now=now, require_pending_pick=require_pending_pick)
+        plan["skipped"].update(skips)
+
+        # ── LEAGUE PINNING (added 2026-10-10 for H1) ───────────────────────
+        #
+        # WHY IT IS NOT OPTIONAL FOR H1. A trajectory is three observations of
+        # the SAME fixture. Without a pinned set the candidate ordering decides
+        # which leagues survive the credit cap, and a different league each
+        # round scatters single observations across many fixtures instead of
+        # building a triple on a few — spent credits that produce unusable
+        # evidence, which is a defect rather than a cost.
+        #
+        # Named rather than silent: a requested league with no imminent
+        # fixture, and every league dropped by the pin, both appear in
+        # `skipped` so "nothing to collect" and "not asked for" stay different
+        # facts.
+        if leagues is not None:
+            wanted = set(leagues)
+            for lg in list(league_fixtures):
+                if lg not in wanted:
+                    plan["skipped"][lg] = "not in the pinned league set"
+                    league_fixtures.pop(lg)
+            for lg in sorted(wanted - set(league_fixtures)):
+                plan["skipped"].setdefault(
+                    lg, "pinned, but no fixture inside the window")
+            plan["pinned_leagues"] = sorted(wanted)
+        plan["candidates"] = [
+            {"league": lg, "fixtures": len(fx),
+             "next_kickoff": min(x["match_date"] for x in fx).isoformat()}
+            for lg, fx in league_fixtures.items()
+        ]
+
+        # A league refreshed inside the interval is already fresh enough;
+        # spending again buys nothing.
+        if league_fixtures and min_interval_minutes > 0:
+            since = now - timedelta(minutes=min_interval_minutes)
+            recent = self._leagues_refreshed_since(list(league_fixtures), since)
+            for league in list(league_fixtures):
+                if league in recent:
+                    plan["skipped"][league] = (
+                        f"refreshed within the last {min_interval_minutes} min")
+                    league_fixtures.pop(league)
+
+        # THE PICKS-RUN GUARD, REDESIGNED. PER-LEAGUE, not a per-day marker.
+        #
+        # A refresh rewrites `odds` for fixtures near kickoff and the picks run
+        # READS `odds`. The crons order them (03:00 against 10:47), but that is
+        # a scheduling coincidence: measured 2026-09-17, 0 of 18 runs under the
+        # current cron overlapped the first refresh — by a margin of 41 minutes,
+        # against a scheduler documented at 0.5-5.7h and observed once at
+        # 11h21m — BOTH figures belong to the RETIRED `37 9 * * *` regime
+        # (n=39), not to the cron in force. Under the OLD cron the same question
+        # answered 133 of 223. Re-measured 2026-10-02: `0 3 * * *` ran 4h11m to
+        # 6h35m over n=32, and `0 0 * * *` has n=1. See daily-picks.yml for the
+        # per-regime table; a delay figure without its cron gets re-pooled.
+        #
+        # THE REVERTED VERSION ASKED THE WRONG QUESTION. It asked "have today's
+        # picks run", keyed on `date.today()`, and declined globally. Those
+        # diverge at every hour outside the picks window, which is where the
+        # overnight declines came from.
+        #
+        # THE RIGHT QUESTION IS "could this refresh change a price a PENDING
+        # picks run will read". A refresh cannot contaminate a pick already
+        # taken — `taken_odds` is persisted at pick time — so the exposure is to
+        # OTHER fixtures in the SAME league that a pending run might still
+        # price. Hence: per-league, conditional on unpicked fixtures remaining.
+        #
+        # Three conditions, ALL required, and the first two are what make the
+        # overnight case impossible:
+        #   1. `now` is inside the bounded exposure window after the cron;
+        #   2. no pick carries today's `pick_date` (the run has produced
+        #      nothing yet — it collapses the moment the run writes anything);
+        #   3. THIS league still holds a future fixture with no pick.
+        if league_fixtures:
+            for league, declined in self._leagues_a_pending_run_could_price(
+                    list(league_fixtures), now).items():
+                plan["skipped"][league] = declined
+                league_fixtures.pop(league, None)
+                # The audit pattern was left in `ci_audit` when the guard was
+                # reverted, deliberately. RULE: a guard and its audit pattern
+                # ship together, or the guard is invisible by construction and
+                # its silence is indistinguishable from health.
+                logger.warning(
+                    f"PICKS-RUN GUARD: DECLINING {league} — {declined}")
+
+        # L2: a league that returned an empty event list three runs running is
+        # not priced by the provider. Requesting it again cannot produce an
+        # observation, so declining costs no coverage. The exclusion expires.
+        barren = BarrenLeagueCache()
+        if league_fixtures:
+            for league in list(league_fixtures):
+                if barren.should_skip(league):
+                    plan["skipped"][league] = (
+                        "no odds returned on the last "
+                        f"{BARREN_CONSECUTIVE_THRESHOLD} attempts "
+                        f"(retried after {BARREN_TTL_DAYS}d)")
+                    league_fixtures.pop(league)
+
+        plan["requested"] = list(league_fixtures)
+        plan["credits_estimated"] = credits_for(len(league_fixtures))
+
+        if not league_fixtures:
+            # ── REASONS, NOT A COUNT. 2026-10-18. ──────────────────────────
+            #
+            # This line printed `— 4 league(s) skipped` and nothing else, on
+            # three consecutive H1 collection runs (10-13, 10-14, 10-15). By
+            # the time anyone asked WHY, `is_fixture` had been flipped from
+            # true to false on all three days by the post-picks results
+            # scrape, so the state that produced the decision was gone and the
+            # question had become unanswerable.
+            #
+            #     A count with no reasons is auditable only until the state
+            #     changes.
+            #
+            # `plan["skipped"]` has carried the reasons the whole time -
+            # `_imminent_league_fixtures` builds them per league at the moment
+            # of the decision. Only the log threw them away.
+            detail = ("; ".join(f"{lg}={why}"
+                                for lg, why in sorted(plan["skipped"].items()))
+                      or "no league reached the selection at all")
+            logger.info(
+                f"TheOddsAPI imminent refresh: nothing to do (window "
+                f"{window_minutes} min) — {len(plan['skipped'])} league(s) "
+                f"skipped: {detail}")
+            return plan
+
+        if dry_run:
+            logger.info(
+                f"TheOddsAPI imminent refresh [DRY RUN]: would request "
+                f"{len(league_fixtures)} league(s) "
+                f"({plan['credits_estimated']} credits): {list(league_fixtures)}")
+            return plan
+
+        before = getattr(quota, "spent_this_run", 0) if quota else 0
+        written = await self._fetch_and_persist(league_fixtures, quota=quota)
+        after = getattr(quota, "spent_this_run", 0) if quota else 0
+        plan["odds_written"] = written
+        outcomes = getattr(self, "_last_league_outcomes", {})
+        for league, outcome in outcomes.items():
+            # An exception is not evidence the league is unpriced — a timeout
+            # says nothing about the provider's catalogue. Only a clean empty
+            # response counts toward exclusion.
+            if outcome in ("ok", "no_rows"):
+                barren.record(league, empty=(outcome == "no_rows"))
+        barren.save()
+        plan["barren"] = barren.describe()
+        plan["credits_claimed"] = (after - before) if quota else plan["credits_estimated"]
+        plan["credits_remaining_header"] = self._remaining_requests
+
+        # Reconcile against the provider's own counter. The ledger only knows
+        # about spend that went through it; the API counts everything on the
+        # key. Measured 2026-08-10: provider 95 used, ledger 0. Doing this after
+        # the requests rather than before costs one cycle of staleness and saves
+        # a probe call — the response headers we already have carry the truth.
+        if quota is not None and self._used_requests is not None:
+            plan["credits_used_provider"] = self._used_requests
+            plan["credits_used_ledger"] = quota.reconcile(self._used_requests)
+
+        # Per-league attribution (section 7E): every refresh decision is
+        # traceable to a date, league, estimated cost, outcome and reason.
+        # Emitted as one structured line per league so a CI log can be grepped
+        # into a ledger without parsing prose.
+        for league in plan["requested"]:
+            logger.info(
+                f"ODDS_REFRESH date={now:%Y-%m-%d} time={now:%H:%M} "
+                f"league={league} sport_key={LEAGUE_TO_THEODDS_SPORT.get(league)} "
+                f"requests=1 est_credits={CREDITS_PER_REQUEST} "
+                # `outcomes` covers the leagues actually FETCHED. A league in
+                # `plan["requested"]` but absent from it was never requested —
+                # the budget truncated `league_fixtures` inside
+                # _fetch_and_persist without touching this list. It used to
+                # default to `ok`, so on 2026-09-05 and 09-06 four leagues that
+                # were never called each reported success on the very line
+                # whose purpose is to be trusted without parsing prose.
+                f"result={outcomes.get(league, 'not_requested')} "
+                f"reason=imminent_pending_pick")
+        for league, why in plan["skipped"].items():
+            logger.info(
+                f"ODDS_REFRESH date={now:%Y-%m-%d} time={now:%H:%M} "
+                f"league={league or '-'} requests=0 est_credits=0 "
+                f"result=skipped reason={why.replace(' ', '_')}")
+
+        logger.info(
+            f"TheOddsAPI imminent refresh: {written} odds rows from "
+            f"{len(league_fixtures)} league(s), {plan['credits_claimed']} credits "
+            f"claimed (header remaining: {self._remaining_requests})")
+        return plan

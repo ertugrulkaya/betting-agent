@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Data & models
+data/football_betting.db
+data/*.db-shm
+data/*.db-wal
+data/*.db.bak
+data/*.db.local_backup
+data/historical_load_cache.json
+data/scraped_leagues.json
+data/models/*.pkl
+data/models/*.sig
+data/models/ensemble_weights.json
+data/models_local_backup/
+data/picks_sync.json
+data/processed/
+data/raw/
+data/models/bayesian_weights.json
+data/models/calibration.json
+# Local mirror of completed-match history (src/data/history_mirror.py) plus its
+# metadata and sync lock. Rebuilt from the database on demand and cached between
+# CI runs via actions/cache — never a source artifact.
+data/models/match_history.parquet
+data/models/match_history_meta.json
+data/models/*.tmp
+data/models/*.lock
+# Per-shard candidate files handed from `--picks --shard` to `--picks --collect`.
+data/candidates/
+data/models/ev_threshold.json
+data/models/pick_calibration.json
+data/models/picks_sent_date.txt
+logs/
+
+# CI logs fetched locally
+ci_logs/
+
+# Secrets
+.env
+.env.local
+config/config.yaml
+
+# IDE & local tooling
+.vscode/
+.idea/
+*.swp
+.claude/settings.local.json
+
+# Separate MCP server projects (not part of betting agent)
+mcp-servers/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# BMAD Method v6
+_bmad-output/
+_bmad/_memory/
+_bmad/config.user.toml
+_bmad/custom/*.user.toml
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Stage 15 L2: runtime record, restored from the Actions cache, never committed.
+data/odds_barren_leagues.json
+data/models/theodds_credits.json
+
+# Runtime state production READS and rewrites each run. Enumerated 2026-09-10
+# after data/models/theodds_credits.json was committed with a value fabricated
+# by the test suite. None of these is an artefact; all are per-environment.
+# data/baselines/ is deliberately EXCLUDED from this list — those are tracked
+# evidence, written only by an explicit `scripts/run_baseline.py` run.
+data/models/ensemble_loss_weights.json
+data/models/probability_calibration.json
+data/models/model_accuracies.json
+data/models/ml_zero_count.json
+data/models/feature_list.json
+data/models/cold_streak_alerted_date.txt
+data/models/retrain_provenance.json
+# ^ scripts/model_freshness.py's record of which RUN first observed
+#   each model `trained_at`. Generated, cache-carried, never a source.
+data/briefings_sent.json
