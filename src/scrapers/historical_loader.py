@@ -195,8 +195,14 @@ class HistoricalDataLoader(BaseScraper):
             )
             return 0
 
+        # Only load leagues that are actually configured — each CSV row costs
+        # several round-trips to a remote DB, so unused leagues are pure waste.
+        configured = set(self.config.get("scraping.flashscore_leagues", []) or [])
+
         # Main leagues (mmz4281 per-season format)
         for league, info in LEAGUE_CSV_MAP.items():
+            if configured and league not in configured:
+                continue
             for season in seasons:
                 refresh_days = (
                     CURRENT_SEASON_REFRESH_DAYS
@@ -220,6 +226,8 @@ class HistoricalDataLoader(BaseScraper):
 
         # Extra leagues (/new/ all-seasons format)
         for league, info in EXTRA_LEAGUE_CSV_MAP.items():
+            if configured and league not in configured:
+                continue
             cache_key = f"extra/{league}"
             if self._is_fresh(cache, cache_key, CURRENT_SEASON_REFRESH_DAYS):
                 skipped += 1
