@@ -65,7 +65,7 @@ EXTRA_LEAGUE_CSV_MAP = {
 }
 
 # Season codes for mmz4281 format (yy/yy format)
-SEASONS = ["2425", "2324", "2223"]
+SEASONS = ["2627", "2526", "2425"]
 
 # How many recent seasons to keep from /new/ format files
 EXTRA_SEASONS_LIMIT = 3
@@ -73,7 +73,7 @@ EXTRA_SEASONS_LIMIT = 3
 # Cache file tracking when each league/season was last loaded
 CACHE_FILE = Path("data/historical_load_cache.json")
 
-# Past seasons (2324, 2223) are nearly immutable — refresh once every 60 days
+# Past seasons (2526, 2425) are nearly immutable — refresh once every 60 days
 PAST_SEASON_REFRESH_DAYS = 60
 # Current season and extra leagues get new rows weekly — refresh every 7 days
 CURRENT_SEASON_REFRESH_DAYS = 7
@@ -174,7 +174,7 @@ class HistoricalDataLoader(BaseScraper):
         per-row existence checks over the network.
         """
         seasons = seasons or SEASONS
-        current_season = seasons[0]  # Most recent season code (e.g. "2425")
+        current_season = seasons[0]  # Most recent season code (e.g. "2627")
         total_loaded = 0
         cache = self._load_cache()
         skipped = 0
