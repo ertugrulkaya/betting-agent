@@ -36,6 +36,20 @@ from src.scrapers.footballdata_competitions import (  # noqa: E402
     COMPETITION_MAP, STATUS_NOT_PLAYABLE as _STATUS_NOT_PLAYABLE,
     STATUS_UPCOMING as _STATUS_UPCOMING)
 
+
+def _kickoff_in_future(utc_date: Optional[str]) -> Optional[bool]:
+    """True if `utcDate` (ISO-8601, e.g. '2026-10-31T14:00:00Z') is after now,
+    False if it is not, None if it does not parse."""
+    if not utc_date:
+        return None
+    try:
+        kickoff = datetime.fromisoformat(str(utc_date).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if kickoff.tzinfo is None:
+        return None
+    return kickoff > datetime.now(kickoff.tzinfo)
+
 # football-data.org full team name → name used in our DB (from football-data.co.uk CSVs)
 TEAM_NAME_MAP: Dict[str, str] = {
     # England — Premier League
