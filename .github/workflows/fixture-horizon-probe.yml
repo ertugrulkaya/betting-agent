@@ -1,0 +1,264 @@
+name: Fixture Horizon Probe
+
+# READ-ONLY probe for the PROSPECTIVE schedule margin.
+#
+# WHY IT EXISTS. The margin needs tomorrow's earliest kickoff and the database
+# cannot supply it: `max_days_ahead=1` is a ROLLING 24 HOURS from the moment of
+# the run, so measured 2026-10-10 the table held 117 fixtures for that day and
+# ZERO for the next, the furthest `match_date` in the whole table was 19:30
+# that evening, and no fixture has EVER been known more than 14.6 hours before
+# kickoff.
+#
+# WHY NOT WIDEN `max_days_ahead` INSTEAD: that changes which fixtures enter the
+# card, which is a cohort event by the `s5.15` precedent. This probe persists
+# NOTHING — proved by a row census over every table, with a positive control
+# that fails when a write is injected.
+#
+# > A read-only operation on our data can still be a write to the relationship
+# > with a provider. Read-only names the wrong boundary.
+#
+# THE PROVIDER LOAD IS THE REAL COST, so it is bounded and watched:
+#   * window is 2 DAYS, the requirement, not the 8 the density demonstration
+#     used. BUT THAT BUYS NO TRAFFIC REDUCTION, and the first draft of this
+#     comment claimed it did. `_click_load_more` clicks to its own 15-second
+#     budget regardless of `max_days_ahead`, which filters rows AFTER they are
+#     fetched — so a 2-day and an 8-day probe load the SAME 30 pages. The
+#     narrow window is for correctness (it bounds what the probe claims to
+#     know), not for load.
+#   * SO THE HONEST COST IS A DOUBLING: daily-picks already fetches these 30
+#     fixtures pages once a day, and this adds a second pass. 30 -> 60
+#     page-loads/day against Flashscore. MEASURED 2026-10-10: 30/30 pages,
+#     0 refused, 155.1s wall.
+#   * BASELINE, measured from CI logs BEFORE this shipped, over the last 5
+#     scheduled daily-picks runs = 150 league-page fetches:
+#         Fixtures page failed .............. 0
+#         Fixtures page retry also failed ... 0
+#         [Flashscore] Timeout on ........... 0
+#         leagues scraped ................... 30/30 every run
+#     So the pre-probe refusal and timeout rate is 0%.
+#   * STOP CONDITION, STATED BEFORE THE POST-SHIP MEASUREMENT. The probe is
+#     DISABLED and the deadline falls back to the 12:00 weekday constant if ANY
+#     of these holds on the daily audit's reading:
+#         (a) terminal refusals ("retry also failed") > 2 in a single run;
+#         (b) the 7-day mean of terminal refusals > 1.0 per run;
+#         (c) leagues scraped < 28 of 30 on two consecutive runs.
+#     Against a 0/150 baseline, (a) is a 6.7% single-run league loss and (b) a
+#     sustained 3.3% — both far above transient noise, which the scraper's own
+#     one-shot retry already absorbs.
+
+on:
+  # 18:00 UTC. The measured scheduler lateness is 3h58m-5h04m, so this lands
+  # 21:58-23:04 and finishes by ~23:12.
+  #
+  # IT OVERLAPS NOTHING, and the clearances are stated rather than assumed:
+  #
+  #   H1 collection   `0 9 * * 2,3,4` starts 12:58-14:04 and its three rounds
+  #                   run 240 min, ending by ~17:00.  CLEARANCE 298 min.
+  #                   (`0 9` was the probe's first choice and would have started
+  #                   in the SAME window as H1 — caught before shipping.)
+  #   daily-picks     weekday `0 4` starts 07:58-09:04, ends by 10:16.
+  #                   CLEARANCE 701 min.
+  #   daily-picks     weekend `0 0` starts 03:58-05:04, ends by 06:16.
+  #                   CLEARANCE 945 min.
+  #   NEXT daily-picks run, the one this probe is warning about: starts 03:58
+  #   (weekend) or 07:58 (weekday). LEAD TIME for the operator 286 min.
+  #
+  # And a 2-day window from ~22:00 on day D has a cutoff of D+2 22:00, which
+  # covers every kickoff on D+1 — the day the next run serves.
+  # ── THE SCHEDULE IS DISABLED, 2026-10-18. THE PROBE HAS NEVER FUNCTIONED. ──
+  #
+  # NOT a cron move. A `workflow_run` trigger on `daily-picks` completion was
+  # the obvious fix - it would order the two jobs BY DEPENDENCY instead of by
+  # a margin, which is the right instinct and the wrong constraint. Measured
+  # first, and the measurement says the ordering was never the binding one:
+  #
+  #   MEASURED 2026-10-18, n=1,131 fixture rows written since 2026-09-01:
+  #     lead time write -> kickoff   mean 8.98h  median 8.72h  MAX 23.62h
+  #     rows ever known >24h ahead   ZERO
+  #
+  # The probe serves TOMORROW. Tomorrow's earliest kickoff is 10:15 (weekend)
+  # or 09:59 observed (weekday), which is 24-28 HOURS away from any probe run
+  # on day D. `matches` has never held a fixture that far ahead, because
+  # `max_days_ahead` is a rolling 24h and the scrape that writes D+1's early
+  # card is D+1'S OWN - which runs after every probe that targets D+1.
+  #
+  #     The target day's population cannot exist when the probe runs, under
+  #     ANY ordering. ORDERING_INVERTED is structural, not a timing accident.
+  #
+  # So a `workflow_run` trigger would fix probe-vs-scrape ordering, change
+  # nothing about the target day, and keep paying. The ordering states stay in
+  # the code - a state that becomes rare must not be deleted, and this one is
+  # not even rare - but the schedule stops.
+  #
+  # THE MEASURED COST OF LEAVING A NON-FUNCTIONAL PRODUCER RUNNING:
+  #     30 Flashscore page-loads per run, 30/30 on every fetching run
+  #     8 fetching runs 10-12..10-18  =  240 page-loads
+  #     deadlines emitted             =  ZERO
+  #   and it DOUBLED the fixtures-page load, 30 -> 60 per day.
+  #
+  # ── ITS REMAINING PURPOSE, SIZED 2026-10-19 ───────────────────────────
+  #
+  # The day-ahead deadline now comes from the EXTERNAL REFERENCE instead
+  # (football-data.org, `/matches?date=D+1`, free tier 10/min and no daily
+  # limit, ONE stdlib HTTPS GET from the audit job). So the question is
+  # whether this probe still has a job at all, and the answer is yes --
+  # exactly one, and it is measurable:
+  #
+  #     COVERAGE. The reference covers 9 of the 30 configured leagues, so its
+  #     minimum is an UPPER BOUND on the true minimum and errs LATE. This
+  #     probe fetches ALL 30: `pages fetched : 30/30` on every one of the 8
+  #     fetching runs. Its data was never the problem.
+  #
+  # WHAT THAT GAP IS WORTH, measured on the one date in the record where an
+  # uncovered league carries the earliest kickoff -- Easter Monday 2026, truth
+  # 10:15 in `poland/ekstraklasa`, earliest COVERED fixture 10:30 in
+  # `italy/serie-a`:
+  #
+  #     the coverage gap costs FIFTEEN MINUTES of deadline accuracy
+  #     against 60 Flashscore page-loads a day
+  #
+  # AND 15 MINUTES IS IMMATERIAL UNDER THE CRON IN FORCE. Replayed under
+  # `0 0`, that same date leaves a +253m margin; it was under `0 4` that it
+  # left +14m and alarmed. So the gap matters only if the weekday cron moves
+  # late again.
+  #
+  # RE-ENABLE CONDITION, now TWO clauses, both required:
+  #   (1) `verify_offset`'s deferred repair - take the clock from the runner
+  #       rather than from a fixture both sides hold. SEVEN of the 8 fetching
+  #       runs refused with "the clock is not established"; only the eighth
+  #       reached the ordering guard. This is the binding blocker.
+  #   (2) a schedule under which 15 minutes is inside the margin. Today it is
+  #       not, so even a repaired probe would buy nothing worth 60 page-loads.
+  # `workflow_dispatch` is kept so the repair can be tested without a push.
+  #
+  # NOTHING IS LOST BY STOPPING. The probe has never emitted a deadline, so
+  # the prospective check loses a capability it never had -- and the
+  # prospective margin is no longer UNEVALUATED either way: `ci_audit` now
+  # computes it from the reference every run, with its coverage printed.
+  workflow_dispatch:
+    inputs:
+      days_ahead:
+        description: 'Probe window in days. The requirement is 2.'
+        default: '2'
+      report_only:
+        description: 'Never exit non-zero (no alert, no red run)'
+        type: boolean
+        default: false
+
+# ITS OWN GROUP. It must not queue behind or ahead of anything, and it holds a
+# runner for only a few minutes.
+concurrency:
+  group: fixture-horizon-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    # The 8-day, 30-league demonstration on 2026-10-10 completed well inside
+    # ten minutes; the 2-day window fetches the same 30 pages with a narrower
+    # parse. 20 is ~3x the observed wall time and is deliberately small: a
+    # browser hung on a page must die, not drift.
+    timeout-minutes: 20
+
+    env:
+      # THE CLOCK IS SET AND THEN VERIFIED. Flashscore renders in the BROWSER's
+      # timezone: the 2026-10-10 density probe ran on a Europe/Kyiv machine and
+      # returned UTC+3, and an assumed offset is how the H1 collection cron was
+      # set three hours late. Pinning TZ is necessary and NOT sufficient — the
+      # probe cross-checks itself against `matches`, which stores UTC, and
+      # refuses to emit a deadline unless the offset it measures is zero.
+      TZ: UTC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        # Selenium and Chrome are needed here and nowhere else in this job set.
+        # Same `sqlalchemy<2.1` bound as the other workflows: 2.1 changed the
+        # default DBAPI for a bare `postgresql://` URL to psycopg v3.
+        # FROM requirements.txt, NOT A HAND-CURATED LIST. The list that stood
+        # here omitted `aiohttp`, which `src/scrapers/base_scraper.py` imports,
+        # so the ONE probe run that has ever happened died 21 seconds in with
+        # `ModuleNotFoundError: No module named aiohttp` - measured
+        # 2026-10-11, run 38177680734. `aiohttp` was in requirements.txt the
+        # whole time.
+        #
+        #     A hand-curated dependency list is a SECOND DEFINITION of the
+        #     dependency set, and the two diverge the moment an import is
+        #     added anywhere upstream.
+        #
+        # `webdriver-manager` is the one genuine extra: it is NOT in
+        # requirements.txt and only this job needs it.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt
+          pip install -c constraints.txt webdriver-manager
+
+      - name: Create directories
+        run: mkdir -p data/models logs
+
+      - name: Create config from example
+        run: cp config/config.example.yaml config/config.yaml
+
+      - name: Confirm the clock the job will hand the browser
+        run: |
+          echo "TZ=$TZ"
+          date -u '+runner UTC: %Y-%m-%d %H:%M:%S'
+          python -c "import datetime,time;print('python local:',datetime.datetime.now().isoformat(),'tzname:',time.tzname)"
+
+      - name: Probe and evaluate the prospective margin
+        id: probe
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+          PROBE_ALERT_BODY: ${{ runner.temp }}/probe_alert.txt
+          PROBE_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ARGS="--days-ahead ${{ inputs.days_ahead || '2' }}"
+          if [ "${{ inputs.report_only }}" = "true" ]; then ARGS="$ARGS --report-only"; fi
+          set +e
+          python -m scripts.fixture_horizon_probe $ARGS
+          code=$?
+          set -e
+          echo "probe_exit=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: Alert when the prospective margin is short
+        id: probe_alert
+        if: always() && steps.probe.outputs.probe_exit != '0'
+        # The clearing action travels in the ALERT TEXT, not only in the
+        # ledger — `fixtures_zero_active` was noise because the remedy lived
+        # somewhere the reader was not.
+        # THREE EXIT CODES, THREE TEXTS. One fixed sentence for every
+        # non-zero exit is what sent the operator a margin finding from a job
+        # that had computed no margin: 1=FINDING, 2=MACHINERY, 3=REFUSAL.
+        # The probe renders the body itself when it has numbers, so the alert
+        # carries the kickoff and the last safe dispatch time rather than
+        # asking the reader to subtract a runtime.
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BODY_FILE: ${{ runner.temp }}/probe_alert.txt
+          CODE: ${{ steps.probe.outputs.probe_exit }}
+        run: |
+          if [ -s "$BODY_FILE" ]; then
+            MSG="$(cat "$BODY_FILE")"
+          elif [ "$CODE" = "2" ]; then
+            MSG="PROBE CRASHED - this is MACHINERY, not a finding. NOTHING was probed, so NOTHING is known about tomorrow's margin; do not read the absence of a deadline as a safe one. CLEARING ACTION: fix the probe. While it is down the prospective check is UNEVALUATED, and the retrospective deadline falls back to the 12:00 weekday constant, which is LAXER than the discovered card - measured over n=235 days, the discovered deadline would have alerted 23 times and the fallback 0, so the outage SILENCES alerts rather than adding them."
+          elif [ "$CODE" = "3" ]; then
+            MSG="PROBE REFUSED by design - the clock is unverified, or no deadline could be discovered for tomorrow. The margin is UNKNOWN and NOT safe. This is the probe working, not failing."
+          else
+            MSG="Probe exited $CODE with no rendered body - unclassified, which should not happen. Treat as MACHINERY."
+          fi
+          python -m scripts.ci_alert "$MSG
+
+          Logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"

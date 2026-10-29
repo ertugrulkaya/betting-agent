@@ -1,0 +1,325 @@
+name: H1 Collection
+
+# H1's price-path collection: ONE job, THREE requests, IN-JOB WAITS.
+#
+# WHY NOT A CRON. Measured 2026-10-10 from
+# `gh run list --workflow=closing-lines.yml --limit 200` (event=schedule, the
+# listing TRUNCATED at 200 so counts are lower bounds): the nominal 8-slot,
+# 120-minute cron fires a MEDIAN OF FOUR SLOTS A DAY, shaped as a 12-24 minute
+# pair followed by ~200-minute gaps. The pair falls below
+# `MIN_GAP_MINUTES = 30`, so the two runs in it are ONE separated instant and
+# the second slot buys nothing. Simulated against those measured slots and real
+# fixtures, EVERY `min_interval` from 120 down to 30 yields ZERO qualifying
+# trajectories for 316 credits.
+#
+# A nominal schedule is not an observed cadence. The spacing is therefore
+# produced inside the job, where it is deterministic and verifiable per fixture
+# instead of inferred from a cron expression.
+#
+# THE REPOSITORY IS PUBLIC, so Actions minutes are free and unmetered. A job
+# that holds a runner for four hours costs nothing here; on a private repo it
+# would consume ~1,680 of 2,000 monthly minutes over seven days and this design
+# would not be affordable.
+#
+# ── CORRECTED 2026-10-20. THIS PARAGRAPH WAS WRONG FOR ELEVEN DAYS. ────────
+#
+# It read: "NO CRON YET — `workflow_dispatch` ONLY, DELIBERATELY. The trial
+# precedes the loop. The cron is added after a dispatched trial reports its
+# measured gaps, so that a scheduled run can never be the first time this path
+# executes." That was true when written and FALSE from `d8df667`, which added
+# `0 9 * * 2,3,4` for the collection loop.
+#
+# A HEADER THAT CONTRADICTS THE FILE IT SITS IN IS THE MOST LOAD-BEARING STALE
+# STRING THIS PROJECT HAS FOUND. Anyone auditing the trigger — including me,
+# three times — read the paragraph and stopped. The cron then fired three days
+# past the experiment's window and spent 8 TheOddsAPI credits from the pricing
+# pool, and the reason nobody caught it is written here.
+#
+# THE PLAN IT DESCRIBES WAS CARRIED OUT: the dispatched trial ran 2026-10-10
+# (38053287510), the cron was added, and four scheduled runs followed on 10-13,
+# 10-14, 10-15 and 10-20. The experiment closed at n=4 of 39 (power 0.073) and
+# the cron is now REMOVED — see the `on:` block below for the measurement.
+#
+# THE SCHEDULING ARITHMETIC IS RETAINED because a re-run would need it: three
+# rounds 120 minutes apart must finish before the evening kickoff cluster, and
+# a 14:30 UTC start puts requests at ~14:30 / 16:30 / 18:30, inside the
+# 360-minute window of a 20:00 kickoff. `0 9` was chosen to land there after
+# the measured 3h58m–5h04m scheduler lateness.
+
+on:
+  # ── THE CRON COMPENSATES FOR THE SCHEDULER'S OWN LATENESS ─────────────────
+  #
+  # MEASURED 2026-10-10 from `gh run list --workflow=daily-picks.yml`
+  # (scheduled events, regime `0 0 * * *`, n=9): GitHub fires this repo's crons
+  # **3h58m to 5h04m LATE**, mean 4h31m, sd 18.2 min. A cron is therefore a
+  # request for a start time, not a start time.
+  #
+  # THE BAND IS ONLY 120 MINUTES WIDE. A job starting at T observes a fixture
+  # on all three rounds only if the kickoff falls in (T+240, T+360] — round 1
+  # must be inside the 360-minute window and round 3 must still be pre-kickoff.
+  # So a 66-minute spread in start time moves the band by 66 minutes, against a
+  # 120-minute target.
+  #
+  # `0 9` TARGETS THE 19:00 UTC EUROPEAN SLOT: start lands 12:58-14:04, and the
+  # band needs a start in [13:00, 15:00) for a 19:00 kickoff. All but the first
+  # two minutes of the measured range qualifies.
+  #
+  # CORRECTED FROM `0 12` THE SAME DAY. The density probe reads Flashscore
+  # pages, which render in the BROWSER's timezone — Europe/Kyiv, UTC+3 — and I
+  # took its timestamps for UTC. Verified against the production `matches`
+  # table, which stores UTC: france/ligue-1 reads 15:15 and 18:45x4 in the DB
+  # against 18:15 and 21:45x4 in the probe, and spain/laliga 14:15/16:30/19:00
+  # against 17:15/19:30/22:00 — exactly +3:00 on 12 fixtures across 3 leagues.
+  # The European slot is 19:00 UTC, not 22:00. Second instance in three days of
+  # "verify the timezone of the clock that produced it", and the first where the
+  # error pointed the other way: the figure looked LATER than reality, so the
+  # cron was set three hours too late and the band would have opened after
+  # kickoff. Fixture COUNTS and trajectories-per-credit are frame-invariant and
+  # are unaffected; only the clock times moved.
+  #
+  # TUESDAY, WEDNESDAY, THURSDAY ONLY, and that is the density finding rather
+  # than a convenience. Measured over 10-11..10-16 (Flashscore fixtures pages,
+  # `max_days_ahead=8`), trajectories per credit:
+  #
+  #     Thu 10-15  18/12 = 1.50      <- 37 fixtures at TWO kickoff times
+#                                     (16:45 and 19:00 UTC)
+  #     Tue 10-13  15/12 = 1.25      <- 17 fixtures at THREE kickoff times
+#                                     (16:45, 18:45, 19:00 UTC)
+  #     Wed 10-14  11/12 = 0.92
+  #     Sun 10-11  13/36 = 0.36      <- 73 fixtures at TWENTY-SIX kickoff times
+  #     Fri 10-16  11/36 = 0.31
+  #     Mon 10-12   6/30 = 0.20
+  #
+  # A WEEKEND CARD IS BIGGER AND WORTH LESS. Sunday has 73 fixtures to
+  # Thursday's 37 and yields a QUARTER of the trajectories per credit, because
+  # domestic weekend kickoffs are staggered across 26 times for television
+  # while European competition rounds are simultaneous by design — 19 fixtures
+  # at 19:00 UTC on Thursday alone. A trajectory needs simultaneity inside a
+  # 120-minute band, so the collection is weighted MIDWEEK, which is the
+  # opposite of where the card is.
+  # ── SCHEDULE DISABLED 2026-10-20. THE WINDOW CLOSED 2026-10-17. ──────────
+  #
+  # THE EXPERIMENT IS CLOSED: n=4 of 39, floor 33, power 0.073, NO ANALYSIS.
+  # The reservation deactivated on 2026-10-17 — `h1_reservation(2026-10-20)`
+  # is 0 and `allocate()` reports `h1_reserved: 0`, `normal_ceiling: 350`.
+  #
+  # AND THE CRON KEPT FIRING. Run 39435238427 started 2026-10-20T13:59:38Z on
+  # `event: schedule`, and MEASURED at 16:13 UTC it had already claimed:
+  #
+  #     theoddsapi      used 334 / 450   remaining 16   updated 16:01:45
+  #     theoddsapi:h1   used  14 / 500                  updated 16:01:46
+  #
+  # The in-window attributed figure recorded on 2026-10-18 was **6** credits
+  # (ledger line 27192, "H1 ATTRIBUTED credits: 6 / bound 168"). So the
+  # POST-WINDOW LEAK IS **8 TheOddsAPI CREDITS**, and because the reservation
+  # is 0 they came out of the NORMAL pool — the one that funds tomorrow's
+  # picks, which had 16 credits left while this job still had ~1h50m to run.
+  #
+  # WHICH POOL: there is no H1 pool any more. `theoddsapi:h1` is an
+  # ATTRIBUTION counter, not an allocation — `remaining()` returns the same 16
+  # for `for_h1=True` and `for_h1=False`, so a closed experiment was spending
+  # the pricing pool.
+  #
+  # THE HEADER COMMENT ABOVE IS STALE and says so now: it reads "NO CRON YET —
+  # `workflow_dispatch` ONLY, DELIBERATELY", which was true until `d8df667`
+  # added this cron for the collection loop. It was never disabled when the
+  # window closed, and the reservation-guard revert (87 refs / 31 assertions /
+  # 9 files) did not touch it — the trigger and the guard are separate things,
+  # and only the guard was reverted.
+  #
+  # `workflow_dispatch` is KEPT so the 2026-11-01 re-run decision can be
+  # executed without a push. RE-ENABLE CONDITION: that decision, taken
+  # deliberately, with a fresh pre-registration — not a resumption of this one.
+  #
+  # ── THE RE-ENABLE CONDITION IS MET. 2026-10-28. ─────────────────────────
+  #
+  # Niki chose the re-run; the window is 2026-11-01..11-08 with its own
+  # pre-registration; the collection defect that starved the first attempt is
+  # fixed; and the reservation is now an ALLOCATION proved by refusal.
+  #
+  # `30 9 1-8 11 *` — AND EVERY FIELD IS DERIVED.
+  #
+  # THE START IS A DISTRIBUTION, NOT A TIME. GitHub fires this repo's crons
+  # 3-5 HOURS LATE, so the nominal is the TARGET MINUS THE MEASURED LATENESS,
+  # never the target. `measured` 2026-10-28, new-cron regime only (n=6):
+  # lateness min 260.9, mean 281.6, max 325.5 min. A `0 14` cron would have
+  # STARTED at 18:20-19:25 and the band would have missed the card entirely.
+  #
+  # WHY 09:30 AND NOT 09:00. `simulated` 2026-10-28, 20,000 trials resampling
+  # that measured series INDEPENDENTLY PER DAY — because each day draws its
+  # own lateness, and a bad draw on one day does not ruin the others:
+  #
+  #     cron     start window     p5   median   P(n>=33)   P(n>=39)
+  #     `0 9`    13:20-14:25      27     46      0.891      0.867
+  #     `20 9`   13:40-14:45      29     46      0.809      0.735
+  #     `30 9`   13:50-14:55      45     69      0.999      0.995
+  #
+  # A THIRTY-MINUTE SHIFT MOVES FLOOR-CLEARING FROM 89% TO 99.9%, because the
+  # kickoff distribution is lumpy — it clusters at 19:00, 19:45 and 20:00, so
+  # a band edge landing just before or just after a cluster changes the day's
+  # count by a factor of two.
+  #
+  # AND THE FIRST CUT OF THIS WAS WRONG IN THE PESSIMISTIC DIRECTION: holding
+  # ONE start time across all eight days gave a worst case of n=31 on 7 dates
+  # — below the floor — for every candidate cron. That model is not the
+  # experiment: the days are independent draws. Correcting it moved `30 9`
+  # from NO-GO to P=0.999.
+  #
+  # `1-8 11` SCOPES IT TO THE WINDOW rather than relying on the reservation to
+  # refuse. Outside the window the stop WOULD halt it spending nothing —
+  # reservation 0 means bound 0 and `0 >= 0` fires RESERVATION_EXHAUSTED — but
+  # a cron that fires every day for ever and is stopped by a guard is how this
+  # workflow came to run three days past its last window. The calendar is the
+  # on/off switch on both sides.
+  schedule:
+    - cron: '30 9 1-8 11 *'
+
+  workflow_dispatch:
+    inputs:
+      max_credits:
+        description: 'Per-job credit ceiling. The trial is 6.'
+        required: true
+        default: '6'
+      leagues:
+        description: 'Comma-separated league keys to PIN (e.g. spain/laliga). Empty = all.'
+        default: ''
+      rounds:
+        description: 'Requests per job. Three is what a qualifying triple needs.'
+        default: '3'
+      gap_minutes:
+        description: 'In-job wait between requests.'
+        default: '120'
+      dry_run:
+        description: 'Print each round plan and spend nothing'
+        type: boolean
+        default: false
+
+# CONDITION 2 — ITS OWN CONCURRENCY GROUP, and the interaction stated rather
+# than discovered.
+#
+# It must NOT share a group with `daily-picks`. This job holds a runner for
+# ~4 hours; a shared group would make a late `daily-picks` queue behind it and
+# lose the card, which is a strictly worse failure than anything H1 can suffer.
+#
+# WHAT HAPPENS IF BOTH ARE LIVE AT ONCE:
+#   * CREDITS cannot collide. H1 spends `for_h1=True` against its own 168-credit
+#     reservation and normal pricing is capped at the 232 remainder, enforced in
+#     `claim_requests` since 2026-10-10.
+#   * PRICES can. `--h1` passes `require_pending_pick=False`, which disables the
+#     picks-run guard, because H1 needs repeated observations of a fixture
+#     INCLUDING after its pick is taken — the guard would truncate every
+#     trajectory at the pick. So a refresh between discovery and pick
+#     generation could move a price the picks run then reads. Bounded by
+#     timing, not by a lock: `daily-picks` fires at 00:00 and has delivered
+#     03:58-05:04 over n=9, and this job is intended for ~14:30. Overlap needs
+#     the scheduler to be ~10 hours late, which the measured series has not
+#     shown under the current cron.
+#   * A pick already taken is NOT at risk: `taken_odds` is persisted at pick
+#     time.
+concurrency:
+  group: h1-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    # CONDITION 1 — AN EXPLICIT BOUND, AS A MULTIPLE OF THE EXPECTED DURATION.
+    #
+    # Expected: (rounds - 1) x gap + runtime = 2 x 120 + ~3 = ~243 minutes.
+    # 330 is ~1.36x that, and it is deliberately BELOW GitHub's 360-minute
+    # hosted-runner ceiling so the bound that fires is OURS and is reported as
+    # a timeout rather than as an opaque platform kill.
+    #
+    # A job that is hung while sleeping is indistinguishable from one that is
+    # working — that is the whole reason this number is stated. The slack
+    # absorbs a slow request or a retry; it does not absorb a second round of
+    # waiting, which is intended: a loop that has lost track of its own
+    # schedule should die, not drift.
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        # Same minimal set and the same `sqlalchemy<2.1` bound as
+        # closing-lines.yml: 2.1 changed the default DBAPI for a bare
+        # `postgresql://` URL to psycopg v3, which is not installed here.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -c constraints.txt "sqlalchemy>=2.0.0,<2.1" psycopg2-binary aiohttp pyyaml python-dotenv loguru numpy scipy
+
+      - name: Create directories
+        run: mkdir -p data/models logs
+
+      - name: Create config from example
+        run: cp config/config.example.yaml config/config.yaml
+
+      - name: Report the stop and the budget BEFORE spending
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+        run: python -m scripts.h1_collection_check --since 2026-10-09
+
+      - name: Collect
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+        # `--max-credits` is REQUIRED by the script: a per-job ceiling stated as
+        # a number before the run, so a loop defect cannot consume the window.
+        run: |
+          # A CRON CANNOT PASS INPUTS, so the scheduled path carries its own
+          # defaults. The pinned set is the union of the four leagues the
+          # density measurement selected; a pinned league with no fixture
+          # inside the window is SKIPPED AT ZERO COST (no request is made), so
+          # pinning the union rather than a per-day list costs nothing and
+          # removes a day-of-week branch that would need its own test.
+          MAXC="${{ inputs.max_credits }}"
+          LEAGUES="${{ inputs.leagues }}"
+          ROUNDS="${{ inputs.rounds }}"
+          GAP="${{ inputs.gap_minutes }}"
+          if [ -z "$MAXC" ]; then MAXC=24; fi
+          if [ -z "$ROUNDS" ]; then ROUNDS=3; fi
+          if [ -z "$GAP" ]; then GAP=120; fi
+          if [ -z "$LEAGUES" ]; then
+            LEAGUES="england/championship,europe/champions-league,europe/europa-league,europe/europa-conference-league"
+          fi
+          ARGS="--max-credits $MAXC --leagues $LEAGUES"
+          ARGS="$ARGS --rounds $ROUNDS --gap-minutes $GAP"
+          echo "max_credits=$MAXC rounds=$ROUNDS gap=$GAP"
+          echo "pinned: $LEAGUES"
+          python -m scripts.h1_collect $ARGS
+          exit $?
+      - name: Report the stop and the trajectories AFTER
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BETTING_AGENT_ALLOW_DEFAULT_HMAC: '1'
+          TABLES_CREATED: '1'
+        run: python -m scripts.h1_collection_check --since 2026-10-09
+
+      # ── THE TELEGRAM FAILURE ALERT WAS REMOVED HERE. 2026-10-22. ──────────
+      #
+      # It said "H1 collection job FAILED or TIMED OUT". That is the run's
+      # conclusion. The sentence it carried about a hung job being
+      # indistinguishable from a working one is a real point, and it is kept:
+      # it belongs to the 330-minute `timeout-minutes` bound above, which is
+      # what actually makes the hang visible, and not to a Telegram message.
+      #
+      # WHAT CARRIES IT NOW: GitHub's own notification on the red run, plus
+      # `ci-audit`, which holds `h1-collect` in `WORKFLOWS` and classifies its
+      # red per workflow.
+      #
+      # AND SAID OUT LOUD: this workflow's SCHEDULE WAS DISABLED 2026-10-20,
+      # so it only runs on dispatch. MEASURED over 2026-09-22..10-22: 5 runs,
+      # 0 failures. This sender had never fired. Nothing is being traded away.
