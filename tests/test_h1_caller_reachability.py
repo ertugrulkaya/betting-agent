@@ -142,7 +142,9 @@ def _seed_trajectory(session, mid, kickoff, offsets=(-300, -180, -60)):
 def _set_h1_spend(mgr, credits):
     """Write H1's ATTRIBUTED counter directly — the ledger row, not a patch."""
     q = OddsApiQuota(mgr, monthly_budget=450, safety_margin=50, for_h1=True)
-    assert q._h1_store.record_attributed(credits, day=month_key(NOW.date())) == credits
+    # The reader keys on the real calendar month, not NOW's, so seed both.
+    for day in {month_key(NOW.date()), month_key()}:
+        assert q._h1_store.record_attributed(credits, day=day) == credits
 
 
 def _run(sc, quota=None):
